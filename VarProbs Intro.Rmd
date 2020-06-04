@@ -1,0 +1,39 @@
+---
+title: "Variant Probabilities Package Intro"
+author: "Ethan Ashby"
+date: "6/4/2020"
+output: pdf_document
+---
+
+```{r Packages, cache=TRUE}
+library(devtools)
+library(tidyverse)
+library(data.table)
+install_github("https://github.com/c7rishi/variantprobs.git")
+library(variantprobs)
+load("./tcga.rda")
+load("./impact.rda")
+```
+
+```{r varprobs test drive, cache=TRUE}
+View(tcga)
+tcga <- data.table::setDT(tcga)
+# calculate variant frequencies for KRAS
+var_freq <- tcga[Hugo_Symbol == "KRAS",
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+var_freq
+v_f <- var_freq$v_f
+names(v_f) <- var_freq$Variant
+
+# calculate cohort size
+m <- length(unique(tcga$patient_id))
+
+# Good Turing estimates
+goodturing_probs(counts = v_f, m = m)
+
+#how are these two different?
+sgt_Delta(counts = v_f, m = m)
+chao_N0(counts = v_f, m = m)
+```
+
