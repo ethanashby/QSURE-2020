@@ -1,0 +1,417 @@
+---
+title: "6_26_2020_week4_metageneclusters"
+author: "Ethan Ashby"
+date: "6/25/2020"
+output: html_document
+---
+
+# Goals 
+1) Optimize/speed up clustering procedure
+2) Understand variability in cluster size and components using Rand Index amongst other things
+3) If time, run probability & NMI calculating procedure where genes are grouped by pathway
+
+## Packages and Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	fig.height = 5,
+	fig.width = 7,
+	message = FALSE,
+	warning = FALSE,
+	comment = NA,
+	results = "hide",
+	cache = TRUE,
+	fig.keep="all"
+)
+
+library(dplyr)
+library(magrittr)
+library(knitr)
+library(devtools)
+library(magrittr)
+library(tidyverse)
+library(data.table)
+#options(buildtools.check = function(action) TRUE )
+#install_github("https://github.com/c7rishi/variantprobs.git")
+library(variantprobs)
+library(rvest)
+library(reshape)
+library(boot)
+library(knitr)
+library(kableExtra)
+library(parallel)
+library(e1071)
+library(drc)
+library(plotly)
+library(spatstat.utils)
+library(DescTools)
+library(GGally)
+library(parallel)
+library(lattice)
+
+data(tcga)
+
+tcga_nh <- data.table::setDT(tcga) %>% filter(MS=="Non-hypermutated")
+
+tcga_genelist<-tcga_nh$Hugo_Symbol %>% unique()
+```
+
+## Implementation
+
+Created a clustering space of scaled 5 metafeatures (Expression, Replication Time, Noncoding mutation rate, local GC content, and HiC compartment).
+```{r}
+#vector of genes in tcga
+tcga_genelist<-tcga$Hugo_Symbol %>% unique()
+
+#read in covariates and remove empty rows
+epigenetic_data<-read.csv("covariate-table.csv", header=TRUE)
+epigenetic_data<-epigenetic_data[epigenetic_data$gene!="",]
+epigenetic_data<-epigenetic_data[epigenetic_data$gene %in% tcga_genelist,]
+
+#create space of epigenetic predictors, Z scale predictors, only complete cases
+cluster_space<-cbind(epigenetic_data$expression_CCLE, epigenetic_data$replication_time, epigenetic_data$noncoding_mutation_rate, epigenetic_data$local_GC_content, epigenetic_data$HiC_compartment)
+rownames(cluster_space)<-epigenetic_data$gene
+cluster_space<-cluster_space[complete.cases(cluster_space),]
+cluster_space<-scale(cluster_space)
+cluster_space<-as.data.frame(cluster_space)
+colnames(cluster_space)<-c("expression", "rep_time", "nc_mut_rate", "loc_GC_cont", "HiC")
+#only include clusters in tcga
+cluster_space<-cluster_space[rownames(cluster_space) %in% tcga_genelist, ]
+```
+
+```{r Functions to Loop}
+
+#######
+#calculate probability matrix
+#######
+
+prob_mat_calc<-function(tcga_clust, cluster_lengths){
+#filter by nonhypermutated mutation signature and non-NA Cancer Code
+tcga_v_f <- tcga_clust[
+  # filter out all hypermutated tumors
+  # & tumors with unknown cancer
+  MS == "Non-hypermutated" & !is.na(Cancer_Code),
+  ][
+    ,
+    # number of tumors per cancer type
+    n_tumor := length(unique(patient_id)),
+    by = Cancer_Code
+    ][,
+      # variant frequencies by CLUSTER, cancer type
+      # also save n_tumor per cancer
+      .(v_f = length(unique(patient_id)),
+        n_tumor = n_tumor[1]),
+      by = .(Variant, Cluster, Cancer_Code)
+      ]
+
+tcga_newprob_given_cancer <- tcga_v_f[,
+    # Calculate Good Turing probabilities of
+    # at least one new variants per CLUSTER & cancer type
+    {
+      GT_probs <- goodturing_probs(
+        counts = v_f,
+        m = n_tumor[1]
+      )
+      .(p_atleast_1new_perMB = GT_probs['atleast_1new'])
+    },
+    by = .(Cluster, Cancer_Code)
+    ] %>%
+  # cast the long data frame into wide format -- fill missing values
+  # (i.e. no mutation for that (CLUSTER, cancer) pair)
+  # with ZERO
+  # replace fill = 0 by
+  # fill = 1 - exp(- 1/(length(unique(tcga$patient_id)) + 1))
+  # to exactly recreate Fig 3b in Nat. Comm. paper
+  dcast(
+    Cluster ~ Cancer_Code,
+    value.var = "p_atleast_1new_perMB",
+    fill = 0
+  ) %>%
+  # put  Clusters as row names
+  # and convert the data table into a matrix
+  magrittr::set_rownames(.$Cluster) %>%
+  .[, Cluster := NULL] %>%
+  data.matrix()
+
+#cancer probs are agnostic to metagene size... correct for metagene size
+tcga_newprob_given_cancer_perMB<-tcga_newprob_given_cancer *1e6/cluster_lengths$cluster_length
+return(tcga_newprob_given_cancer_perMB)
+}
+
+#####
+#Calc NMI
+#####
+
+calc_NMI<-function(tcga_newprob_given_cancer_perbp){
+# Find the relative frequencies of cancer sites
+cancer_npatient <- tcga[
+  !is.na(Cancer_Code) & MS == "Non-hypermutated",
+  .(cancer_npatient = length(unique(patient_id))),
+  by = Cancer_Code
+  ][,
+    cancer_rf := cancer_npatient/sum(cancer_npatient)
+    ]
+
+cancer_prob <- cancer_npatient$cancer_rf %>%
+  setNames(cancer_npatient$Cancer_Code)
+
+# calc_minfo has two main arguments:
+# (a) prob_mat: matrix (( p_gc )), where
+# p_ij = P(Event associated with gene - g | Cancer - c)
+# and (b) cancer_prob: vector ( p_c ) where p_c = P(Cancer - c).
+# names(cancer_prob) and colnames(prob_mat) should be identical
+# The function will return a vector
+# of length nrow(prob_mat), for all genes in prob_mat
+
+nmi <- calc_minfo(
+  tcga_newprob_given_cancer_perbp,
+  cancer_prob,
+  binary_minfo = FALSE,
+  normalize = TRUE
+)
+
+# see the top 20
+return(nmi)
+}
+
+```
+
+```{r eval=FALSE}
+#set up for loop
+prob_array<-array(dim=c(50, 32, 50))
+NMI_mat<-matrix(nrow=50, ncol=50)
+cluster_membership<-vector("list", length=50)
+
+lengths<-data.frame(gene=epigenetic_data$gene[epigenetic_data$gene %in% tcga_genelist], length=epigenetic_data[epigenetic_data$gene %in% tcga_genelist,] %>% summarize(length=end-start))
+
+lengths<-data.frame(gene=epigenetic_data$gene[epigenetic_data$gene %in% tcga_genelist], length=epigenetic_data[epigenetic_data$gene %in% tcga_genelist,] %>% summarize(length=end-start))
+
+strt<-Sys.time()
+for (i in 1:50){
+  print(paste(i, "iterations"))
+  ###run clustering
+  
+  km.res <- kmeans(cluster_space, 50, nstart = 1, iter.max=20)
+  cluster_membership[[i]]<-km.res$cluster
+
+  cluster_assignments<-data.frame("Cluster"=km.res$cluster, "gene"=names(km.res$cluster))
+
+  cluster_lengths<-left_join(cluster_assignments, lengths, by="gene")
+  cluster_lengths<-cluster_lengths %>% group_by(Cluster) %>% summarize(cluster_length=sum(length))
+
+  tcga_clust<-left_join(cluster_assignments, tcga, by=c("gene"="Hugo_Symbol"))
+  tcga_clust<-setDT(tcga_clust)
+  
+  #create prob mat and store in array
+  prob_mat<-prob_mat_calc(tcga_clust, cluster_lengths)
+  prob_array[,,i]<-prob_mat
+  
+  #create NMI and store in NMI_mat
+  NMI_mat[i,]<-calc_NMI(tcga_newprob_given_cancer_perbp=prob_mat)
+}
+print(Sys.time()-strt)
+
+```
+
+```{r eval=FALSE}
+levelplot(NMI_mat[1:100,], xlab="Clusters", ylab="iteration", col.regions=viridisLite::cividis(100))
+
+RRand(cluster_membership[[1]], cluster_membership[[20]])
+
+unique_cancer_types<-tcga_nh$Cancer_Code %>% unique()
+unique_cancer_types<-unique_cancer_types[!is.na(unique_cancer_types)]
+
+indices=which(NMI_mat == max(NMI_mat), arr.ind = TRUE)
+
+to_plot<-data.frame("Cancer_Types"=unique_cancer_types, "GT_Prob"=prob_array[indices[1,2],,indices[1,1]])
+
+ggplot(to_plot)+geom_point(aes(x=Cancer_Types, y=paste(indices[1,1], "metagene", indices[1,2], "iteration"), size=GT_Prob, color=GT_Prob))+theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+scale_color_gradient(low="cyan", high="magenta")+scale_size(range = c(1, 15), breaks=seq(0,1,by=0.1))+ylab(element_blank())
+
+rand_mat<-matrix(nrow=50, ncol=50)
+for (i in 1:50){
+  for (j in 1:50){
+  rand_mat[i,j]<-RRand(cluster_membership[[i]], cluster_membership[[j]])[2] %>% as.numeric()
+  }
+}
+```
+
+```{r Parallel Run, eval=FALSE}
+library(parallel)
+
+lengths<-data.frame(gene=epigenetic_data$gene[epigenetic_data$gene %in% tcga_genelist], length=epigenetic_data[epigenetic_data$gene %in% tcga_genelist,] %>% summarize(length=end-start))
+
+lengths<-data.frame(gene=epigenetic_data$gene[epigenetic_data$gene %in% tcga_genelist], length=epigenetic_data[epigenetic_data$gene %in% tcga_genelist,] %>% summarize(length=end-start))
+
+f_to_apply<-function(i){
+  index=i
+  km.res <- kmeans(cluster_space, 50, nstart = 1, iter.max=20)
+  cluster_members<-km.res$cluster
+
+  cluster_assignments<-data.frame("Cluster"=km.res$cluster, "gene"=names(km.res$cluster))
+
+  cluster_lengths<-left_join(cluster_assignments, lengths, by="gene")
+  cluster_lengths<-cluster_lengths %>% group_by(Cluster) %>% summarize(cluster_length=sum(length))
+
+  tcga_clust<-left_join(cluster_assignments, tcga, by=c("gene"="Hugo_Symbol"))
+  tcga_clust<-setDT(tcga_clust)
+  
+  #create prob mat and store in array... REMEBER these need to be converted to GTprob/MB for visualization... NOT for NMI calc
+  prob_mat<-prob_mat_calc(tcga_clust, cluster_lengths)
+  
+  #create NMI and store in NMI_mat
+  NMI<-calc_NMI(tcga_newprob_given_cancer_perMB=prob_mat)
+  list(Members=cluster_members, Probs=prob_mat, NMI=NMI)
+}
+
+#8 mins to run 500 iterations on 7 cores
+strt<-Sys.time()
+results<-mclapply(X=1:500, FUN=f_to_apply, mc.cores=7)
+print(Sys.time()-strt)
+
+NMI_mat<-matrix(nrow=500, ncol=50)
+for (i in 1:500){
+  NMI_mat[i,]<-results[[i]]$NMI
+}
+
+levelplot(NMI_mat, xlab="Iterations", ylab="Clusters", col.regions=viridisLite::cividis(100))
+
+indices=which(NMI_mat == max(NMI_mat), arr.ind = TRUE)
+#our highest NMI cluster is a 2 gene group (OR4A5 and TPTE)
+top_metagene<-results[[indices[1,1]]]$Members[results[[indices[1,1]]]$Members==indices[1,2]] %>% names() %>% paste(collapse=' ')
+
+#for multiple indices
+more_indices<-which(NMI_mat>0.04, arr.ind = TRUE)
+#second highest NMI cluster has 14 genes
+second_metagene<-results[[more_indices[2,1]]]$Members[results[[more_indices[2,1]]]$Members==more_indices[2,2]] %>% names() %>% paste(collapse=' ')
+
+to_plot<-data.frame("Cancer_Types"=rep(unique_cancer_types, 2), "GT_Prob"=c(results[[indices[1,1]]]$Probs[indices[1,2],], results[[more_indices[2,1]]]$Probs[more_indices[2,2],]), "Metagene"=c(rep(top_metagene, 32), rep(second_metagene, 32)))
+to_plot$Metagene<-str_wrap(to_plot$Metagene, width = 10)
+
+ggplot(to_plot)+geom_point(aes(x=Cancer_Types, y=Metagene, size=GT_Prob, color=GT_Prob))+theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+scale_color_gradient(low="cyan", high="magenta")+scale_size(range = c(1, 15), breaks=seq(0,1,by=0.1))+ylab(element_blank())
+```
+
+I ran the Good-Turing probability and NMI-calculating functions in parallel using 7 cores, outputting cluster members, probability matrices, and the NMI for each iteration in a list. These functions were tweaked to output Good-Turing probabilities per metagene cluster as opposed to per gene, and Good-Turing probabilities were adjusted by the genomic size of the metagene and scaled to a probability/Mb value. I ran the process 500 times with 50 different initial cluster centers for each pass. The whole process took around 8.5 minutes to execute, much faster than my initial attempts. I generated a heatmap illustrating NMI as a function of cluster and iteration. Setting a threshold for NMI (NMI>0.04), I attained two metagenes, extracted their members and their tissue-specific probabilities for plotting.
+
+* OR4A5 & TPTE (NMI=0.0899)
+* ASRGL1, C6orf15, CCHCR1, HLA-B, HLA-C, POU5F1, PSORS1C1, PSORS1C2, SCGB1D1, SCGB1D2, SCGB1D4, SCGB2A1, SCGB2A2, TCF19 (NMI=0.0439)
+
+## Tuning k
+
+We need to tune the number of clusters such that we retrieve the highest normalized mutual information from our clusters. My approach is to step through different values of k, generate NMI's for 100 iterations, and see which k generates the highest distribution of NMIs. Considerations will be mean NMI, 
+
+```{r Tuning K}
+
+#change allowable k
+f_to_apply<-function(i, k){
+  index=i
+  km.res <- kmeans(cluster_space, k, nstart = 1, iter.max=20)
+  cluster_members<-km.res$cluster
+
+  cluster_assignments<-data.frame("Cluster"=km.res$cluster, "gene"=names(km.res$cluster))
+
+  cluster_lengths<-left_join(cluster_assignments, lengths, by="gene")
+  cluster_lengths<-cluster_lengths %>% group_by(Cluster) %>% summarize(cluster_length=sum(length))
+
+  tcga_clust<-left_join(cluster_assignments, tcga, by=c("gene"="Hugo_Symbol"))
+  tcga_clust<-setDT(tcga_clust)
+  
+  #create prob mat and store in array
+  prob_mat<-prob_mat_calc(tcga_clust, cluster_lengths)
+  
+  #create NMI and store in NMI_mat
+  NMI<-calc_NMI(tcga_newprob_given_cancer_perbp=prob_mat)
+  list(Members=cluster_members, Probs=prob_mat, NMI=NMI)
+}
+
+
+############
+#example of cluster that results in NMI<0
+############
+#it's relatively small with 
+lengths[lengths$gene %in% c("GPR22", "OR10A2", "OR10A4", "OR10A5", "OR2AG1", "OR6A2", "OR6C2", "OR6C68", "OR6C70", "OR6C76", "SSR3"),]
+lengths$length[lengths$gene %in% c("GPR22", "OR10A2", "OR10A4", "OR10A5", "OR2AG1", "OR6A2", "OR6C2", "OR6C68", "OR6C70", "OR6C76", "SSR3")] %>% sum()
+
+#One cluster that I found with a negative NMI is a cluster of 12 genes of mostly olfactor receptors... their total length is small (29kb) and their good-turing probabilities are high considering the size.
+
+tcga_v_f <- tcga[
+  # filter out all hypermutated tumors
+  # & tumors with unknown cancer
+  MS == "Non-hypermutated" & !is.na(Cancer_Code),
+  ][
+    ,
+    # number of tumors per cancer type
+    n_tumor := length(unique(patient_id)),
+    by = Cancer_Code
+    ][,
+      # variant frequencies by CLUSTER, cancer type
+      # also save n_tumor per cancer
+      .(v_f = length(unique(patient_id)),
+        n_tumor = n_tumor[1]),
+      by = .(Variant, Hugo_Symbol, Cancer_Code)
+      ]
+
+tcga_v_f<-tcga_v_f %>% filter(Hugo_Symbol %in% c("GPR22", "OR10A2", "OR10A4", "OR10A5", "OR2AG1", "OR6A2", "OR6C2", "OR6C68", "OR6C70", "OR6C76", "SSR3"))
+
+tcga_newprob_given_cancer <- tcga_v_f[,
+    # Calculate Good Turing probabilities of
+    # at least one new variants per CLUSTER & cancer type
+    {
+      GT_probs <- goodturing_probs(
+        counts = v_f,
+        m = n_tumor[1]
+      )
+      .(p_atleast_1new_perMB = GT_probs['atleast_1new'])
+    },
+    by = .(Cancer_Code)
+    ] %>%
+  # cast the long data frame into wide format -- fill missing values
+  # (i.e. no mutation for that (CLUSTER, cancer) pair)
+  # with ZERO
+  # replace fill = 0 by
+  # fill = 1 - exp(- 1/(length(unique(tcga$patient_id)) + 1))
+  # to exactly recreate Fig 3b in Nat. Comm. paper
+  dcast(
+    Cluster ~ Cancer_Code,
+    value.var = "p_atleast_1new_perMB",
+    fill = 0
+  ) %>%
+  # put  Clusters as row names
+  # and convert the data table into a matrix
+  magrittr::set_rownames(.$Cluster) %>%
+  .[, Cluster := NULL] %>%
+  data.matrix()
+
+results500<-mclapply(X=1:5, FUN=f_to_apply, k=500, mc.cores=7)
+results500[[1]]$NMI[140]
+results500[[1]]$Probs[140,]
+indexes<-matrix(ncol=2)
+
+for (i in 1:5){
+indexes<-rbind(indexes, c(i, which(results500[[i]]$NMI<0, arr.ind=TRUE)))
+}
+
+############
+#Before any of this, we have to figure out what negative NMI are
+############
+
+results50<-mclapply(X=1:5, FUN=f_to_apply, k=50, mc.cores=7)
+results100<-mclapply(X=1:5, FUN=f_to_apply, k=100, mc.cores=7)
+results500<-mclapply(X=1:5, FUN=f_to_apply, k=500, mc.cores=7)
+results2000<-mclapply(X=1:5, FUN=f_to_apply, k=2000, mc.cores=7)
+
+NMI_df<-data.frame(matrix(nrow=5*50+5*100+5*500+5*2000, ncol=2))
+res50<-unlist(results50)
+res100<-unlist(results100)
+res500<-unlist(results500)
+res2000<-unlist(results2000)
+
+NMI_df$X1<-c(res50, res100, res500, res2000)
+NMI_df$X2<-c(rep("k=50", 5*50), rep("k=100", 5*100), rep("k=500", 5*500), rep("k=2000", 5*2000))
+NMI_df$X2 <- factor(NMI_df$X2, levels=c("k=50", "k=100", "k=500", "k=2000"))
+
+NMI_df %>% ggplot()+geom_boxplot(aes(x=X2, y=X1, fill=X2))+ylab("NMI")+xlab("Init. Number Clusters k")+theme_bw()+labs(fill = "Number of Initial Clusters k", size=10)+theme(legend.key.size = unit(1.5, "cm"))
+
+NMI_df[NMI_df$X1<0,]
+```
+

@@ -1,0 +1,554 @@
+---
+title: "06/19/2020 All Genes Revision and Epigenetic Data Integration"
+author: "Ethan Ashby"
+date: "6/18/2020"
+output: pdf_document
+---
+
+# Overview
+
+Variantprobs package was updated, so much of the '6_17_2020_all_genes.Rmd' was getting the code up and running and generating a few exploratory plots for a small suite of genes in the non-hypermutated group that met a strict stringency threshold. Ronglai and Saptarshi encouraged me to revise my plots to include a small (~45), medium (~hundreds), and large (~thousands) of genes while including coefficient of variation $SE/estimate$ and normalized estimate $estimate/SE$. Potentially I could even run an analysis scaled by gene length.
+
+```{r chunk options packages functions, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	fig.height = 5,
+	fig.width = 7,
+	message = FALSE,
+	warning = FALSE,
+	comment = NA,
+	results = "hide",
+	cache = TRUE,
+	fig.keep="none"
+)
+
+library(dplyr)
+library(magrittr)
+library(knitr)
+library(devtools)
+library(magrittr)
+library(tidyverse)
+library(data.table)
+#options(buildtools.check = function(action) TRUE )
+#install_github("https://github.com/c7rishi/variantprobs.git")
+library(variantprobs)
+library(rvest)
+library(reshape)
+library(boot)
+library(knitr)
+library(kableExtra)
+library(parallel)
+library(e1071)
+library(drc)
+library(plotly)
+
+data(tcga)
+
+#filter only non-hypermutated genes
+tcga_nh <- data.table::setDT(tcga) %>% filter(MS=="Non-hypermutated")
+
+goodTuring_SE<-function(gene){
+#obtain variant frequencies
+var_freq <- tcga_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+v_f <- var_freq$v_f
+names(v_f) <- var_freq$Variant
+num_samps <- length(unique(tcga_nh$patient_id))
+
+#run goodturing
+GToutput<-goodturing_probs(counts=v_f, m=num_samps)
+
+#output in lis
+output<-list("good_turing"=c(GToutput), "chao"=attributes(GToutput)$N0, "good_turing_se"=attributes(GToutput)$se, "reliable_beta"=attributes(GToutput)$smooth_slope_ok)
+
+output
+}
+
+N_return<-function(gene, thresh=1){
+  #obtain variant frequencies
+  var_freq <- tcga_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+  N=sum(v_f %in% seq(1,thresh,1))
+  N
+}
+```
+
+# goodTuring_SE function
+
+I wrote a function which takes in a gene name, and then outputs a list with four elements: (i) a vector of good-turing probabilities for all seen and unseen variants, (ii) the Chao estimate of N0, (iii) the SE of the Good-Turing estimates, (iv) whether the smoothing algorithm provided a logical beta estimate. 
+I used the function 'mclapply' with 8 cores to apply this function over a list of genes with a mutation rate >0.03 (as in the original Somatic Variant richness paper). Runtime was fast and the output was a list containing all the above information.
+
+# Small Cohort of Genes
+
+Here, I revise my previous analysis within the small cohort of 45 genes that met the strict inclusion threshold (mutation rate>0.03). The coefficient of variation plots show that lower N_1 leads to a higher coefficient of variation for good-turing probabilities, and these genes were typically cancer-related genes. The plot of coefficient of variation vs $N_1$ discriminated the known-cancer related genes and large genes (TTN) quite well. An option to include base r plots with 2 point labeling methods vs. a dynamic interactive point labeling plot through plotly are included
+
+```{r Small Cohort, fig.keep="all"}
+#####
+#Filter genes w/ frequency>0.03
+#####
+
+#sample size
+num_samps<-length(unique(tcga_nh$patient_id))
+
+#filter variants where mutation rate (num_variants/num_samples)>0.03
+#GOI is a vector containing genes of interest to label on the N_1 vs coef of var/norm estimates plot
+varselect_CV_norm_plots<-function(muta_rate_thresh, GOI, interactive=TRUE){
+
+#output vector
+output<-c()
+  
+#filter by mutation rate threshold
+filtered_variants<-tcga_nh %>% dplyr::group_by(Hugo_Symbol) %>% dplyr::filter(dplyr::n()/num_samps>muta_rate_thresh)
+
+#now define your gene list as these filtered genes
+genelist<-filtered_variants$Hugo_Symbol %>% unique()
+
+#print number of filtered genes
+print(paste(length(genelist), "genes passed filter criteria", sep=" "))
+
+#apply over list
+variant_stats<-c(lapply(genelist, goodTuring_SE))
+names(variant_stats)<-genelist
+
+#how many genes show reliable betas? print result
+counter=0
+for (i in 1:length(variant_stats)){
+  if(variant_stats[[i]]$reliable_beta==TRUE){counter=counter+1}
+}
+output<-c(output, counter)
+print(paste(output, "genes produced reliable beta estimates", sep=" "))
+
+#Coefficient of Variation (SE/Estimate) stored in vector
+CVvec<-c()
+for (i in 1:length(variant_stats)){
+  CVvec<-c(CVvec, (variant_stats[[i]]$good_turing_se %>% tail(1))/(variant_stats[[i]]$good_turing %>% tail(1)))
+}
+names(CVvec)<-genelist
+
+#Normalized Estimates stored in vector
+normvec<-c()
+for (i in 1:length(variant_stats)){
+  normvec<-c(normvec, (variant_stats[[i]]$good_turing %>% tail(1))/(variant_stats[[i]]$good_turing_se %>% tail(1)))
+}
+names(normvec)<-genelist
+
+#######
+#barplots of Coefficient of Variation and Normalized Good-Turing Estimates
+######
+barplot(height=sort(CVvec,decreasing=TRUE), ylab="Coefficient of Variation Good-Turing", las=2, cex.names=0.5)
+barplot(height=sort(normvec,decreasing=TRUE), ylab="Normalized Estimates Good-Turing", las=2, cex.names=0.5)
+
+######
+###Density plot of CV and Norm
+######
+
+plot(density(CVvec), xlab="Coef of Var of Good-Turing Estimates", main="")
+legend("topright", inset=0.1, paste("Kurtosis", round(kurtosis(CVvec), 2), "\n", "Skewness", round(skewness(CVvec), 2)), adj = c(0, 0.5), x.intersp = -0.5, y.intersp = 1)
+
+plot(density(normvec), xlab="Coef of Var of Good-Turing Estimates", main="")
+legend("topright", inset=0.1, paste("Kurtosis", round(kurtosis(normvec), 2), "\n", "Skewness", round(skewness(normvec), 2)), adj = c(0, 0.5), x.intersp = -0.5, y.intersp = 1)
+
+######
+###CV and Norm Est vs N1
+######
+
+#extract N_1 for gene cohort
+N_1<-lapply(genelist, N_return, thresh=1)
+N_1<-unlist(N_1)
+
+#CV plot
+
+df=data.frame(cv=CVvec, norm=normvec, n1=N_1, gene=genelist)
+
+if(interactive==TRUE){
+  x=list(title="N1", showgrid = F)
+  y=list(title="Coefficient of Variation")
+  gg<-plot_ly(type="scatter", mode="markers", showlegend=FALSE) %>% add_trace(x=df$n1, y=df$cv, text=df$gene, hoverinfo="text", marker=list(opacity=0.4)) %>% layout(title="Coef of Variation vs N_1", xaxis = x, yaxis = y)
+  print(gg)
+  
+  y=list(title="Normalized Good-Turing Estimates")
+  gg<-plot_ly(type="scatter", mode="markers", showlegend=FALSE) %>% add_trace(x=df$n1, y=df$norm, text=df$gene, hoverinfo="text", marker=list(opacity=0.4)) %>% layout(title="Normalized Estimates vs N_1", xaxis = x, yaxis = y)
+  print(gg)
+}
+
+#if GOI is unspecified, then label every 10 genes
+if(interactive==FALSE){
+if(missing(GOI)){
+  df=df[order(df$cv, decreasing=TRUE),]
+
+  plot(df$n1, df$cv, "p", col="red", ylab="Coef of Var of Good-Turing Probs", xlab="N_1")
+  with(df[seq(1,dim(df)[1],10),], text(cv~n1, labels =rownames(df[seq(1,dim(df)[1],10),]), cex=0.8, pos = 4))
+
+  df=df[order(df$norm, decreasing=TRUE),]
+
+  plot(df$n1, df$norm, "p", col="red", ylab="Coef of Var of Good-Turing Probs", xlab="N_1")
+  with(df[seq(1,dim(df)[1],10),], text(norm~n1, labels =rownames(df[seq(1,dim(df)[1],10),]), cex=0.8, pos = 4))
+}
+
+#if GOI is specified, label the specified genes
+if(!missing(GOI)){
+  df=df[order(df$cv, decreasing=TRUE),]
+
+  plot(df$n1, df$cv, "p", col="red", ylab="Coef of Var of Good-Turing Probs", xlab="N_1")
+  with(df[rownames(df) %in% GOI,], text(cv~n1, labels =rownames(df[rownames(df) %in% GOI,]), cex=0.8, pos = 4))
+
+  df=df[order(df$norm, decreasing=TRUE),]
+
+  plot(df$n1, df$norm, "p", col="red", ylab="Coef of Var of Good-Turing Probs", xlab="N_1")
+  with(df[rownames(df) %in% GOI,], text(norm~n1, labels =rownames(df[rownames(df) %in% GOI,]), cex=0.8, pos = 4))
+                  }
+      }
+}
+
+varselect_CV_norm_plots(muta_rate_thresh = 0.03)
+```
+
+# Medium Cohort of Genes
+Here the inclusion criteria vis-a-vis mutation rate was relaxed, as the cutoff for inclusion was a mutation rate >0.015. 
+
+```{r}
+#filter variants where mutation rate (num_variants/num_samples)>0.015
+#takes <10 seconds to run
+varselect_CV_norm_plots(muta_rate_thresh = 0.015)
+```
+
+# Large Cohort of Genes
+Here the inclusion criteria vis-a-vis mutation rate was relaxed further, as the cutoff for inclusion was a mutation rate >0.001.
+```{r}
+#takes a bit longer to run ~30 seconds
+varselect_CV_norm_plots(muta_rate_thresh = 0.005)
+```
+
+# Epigenetic Data
+
+Understanding mutational heterogeneity is critical to identify genes that are actually cancer-related. Mutation rates vary across cancer types, patients, and regional index. Perhaps most importantly, mutation rates are variable across different regions of the genome, and this is largely attributable to expression coupled DNA repair (where highly expressed genes are maintained better by DNA-repair enzymes, resulting in fewer mutation) and replication timing (late-replicating genes incur higher frequencies of mutations, potentially due to reduced size of the free nucleotide pool). Higher GC-content is also known to increase mutation rate.
+
+From the supplementary information in the paper: "Genes are listed with their chromosomal coordinates, their average expression level across 91 cell lines in the CCLE7, their DNA replication time, expressed on a scale of 100 (early) to 1500 (late), and their average noncoding mutation frequency (mutations per bp), measured from the panel of 126 cancer samples that were subjected to whole-genome sequencing. Also listed for each gene are the local GC content in the genome (measured on a 100kB scale), a HiC12-derived metric indicating which chromosomal compartment the gene is in (negative values = closed compartment “B” "inactive", positive values = open compartment “A” "active"). Finally, a number of technical metrics for each gene are listed, relating to the efficiency and depth of the sequencing process."
+
+I selected these 5 variables (average expression, DNA rep time, average noncoding mutation freq, logit(GC content), HiC12 metric) for the `r length(genelist)` genes in the largest cohort, and scaled and normalized their values. Then I computed a distance matrix for each of these genes, and stepped through each gene and identified it's nearest neighbor in this meta-feature space. By pooling estimates between genes, we can reduce the variance of the Good-Turing estimates.
+
+```{r Averaging GT estimates among pairs doesn't work}
+epigenetic_data<-read.csv("covariate-table.csv", header=TRUE)
+
+#######
+#Pooling of Good-Turing estimates between genes with similar metafeatures
+#######
+
+summary(epigenetic_data)
+
+#large mutation cohort
+filtered_variants<-tcga_nh %>% dplyr::group_by(Hugo_Symbol) %>% dplyr::filter(dplyr::n()/num_samps>0.005)
+
+#now define your gene list as filtered genes
+genelist<-filtered_variants$Hugo_Symbol %>% unique()
+
+#pull out columns that are easy to work with: average expression level, DNA replication time, average noncoding mutation freq, GC content, chromosomal compartment
+test_mat<-cbind(epigenetic_data$expression_CCLE, epigenetic_data$replication_time, epigenetic_data$noncoding_mutation_rate, logit(epigenetic_data$local_GC_content), epigenetic_data$HiC_compartment)
+#all should be in euclidian coordinates and scaled
+rownames(test_mat)<-epigenetic_data$gene
+colnames(test_mat)<-colnames(epigenetic_data[,5:9])
+
+#scale variables
+test_mat<-scale(test_mat, center=TRUE, scale=TRUE)
+test_mat<-test_mat[complete.cases(test_mat),]
+
+#filter for genes that appear in our cohort
+test_mat=test_mat[rownames(test_mat) %in% genelist,]
+
+#calculate pairwise differences
+distances=dist(test_mat, method="euclidian")
+a<-distances %>% as.matrix()
+
+nearest_neighbor<-c()
+for (i in 1:length(rownames(a))){
+  nearest_neighbor<-c(nearest_neighbor, sort(a[i,])[2])
+}
+
+#######
+#Nearest neighbor pairs
+#######
+nn<-cbind(rownames(a), names(nearest_neighbor))
+
+####
+#write function that computes mean GT estimate and SE(mean GT estimate) for gene pairs
+
+
+pair_GT_estimate<-function(genepair, plot=FALSE){
+#NN pair
+var_freq <- tcga_nh[Hugo_Symbol==genepair[1],
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+  
+b<-variantprobs::goodturing_probs(counts=v_f, m=num_samps)
+
+var_freq <- tcga_nh[Hugo_Symbol==genepair[2],
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+  
+c<-variantprobs::goodturing_probs(counts=v_f, m=num_samps)
+
+output=c("meanGT_pool"=mean(c(b %>% head(1), c %>% head(1))), "seGT_pool"=sd(c(b %>% head(1), c %>% head(1)))/sqrt(2), "gene1est"=b %>% head(1), "gene1se"=attributes(b)$se[1], "gene2est"=c %>% head(1), "gene2se"=attributes(c)$se[1])
+
+
+if(plot==TRUE){
+test_pair<-data.frame(est=output[c(1,3,5)], se=output[c(2,4,6)], id=c("pooled", genepair))
+
+plt<-ggplot(test_pair) +
+    geom_bar(aes(x=factor(id, levels=c("pooled", genepair)) , y=est), stat="identity", fill="skyblue", alpha=0.7) +
+    geom_errorbar( aes(x=factor(id, , levels=c("pooled", genepair)), ymin=est-2*se, ymax=est+2*se), width=0.4, colour="orange", alpha=0.9, size=1.3)+theme_bw()+theme(panel.grid.major.x = element_blank(), panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank())+xlab(element_blank())+ylab("Good-Turing Probabilities")
+print(plt)}
+return(output)
+
+}
+
+###
+#Test it out on the two gene neighbors: TP53 and DNM2 
+###
+pair_GT_estimate(genepair=c("TP53", "DNM2"), plot=TRUE)
+
+
+#very poor... not what we were going for with the gene pair
+
+
+######
+#works well on different gene pairing
+######
+
+pair_GT_estimate(genepair=nn[1,], plot=TRUE)
+
+######
+#run over all genes
+######
+
+#may take a few seconds
+res<-apply(FUN=pair_GT_estimate, MARGIN=1, X=nn)
+
+#generate density plots comparing pooled coefficients of variance vs single gene
+pooled_data<-as.data.frame(t(res))
+rownames(pooled_data)<-nn[,1]
+pooled_data$gene<-nn[,1]
+colnames(pooled_data)=c("GT_pool","seGT_pool", "gene1", "segene1", "gene2", "segene2", "gene")
+ggplot(pooled_data)+geom_density(aes(x=seGT_pool/GT_pool), alpha=0.5, color="blue")+geom_density(aes(x=segene1/gene1), alpha=0.3, color="red")+theme_bw()
+```
+
+```{r pool estimates from k variants}
+
+#return GT probabilities given gene
+return_GT_SE<-function(gene){
+  var_freq <- tcga_nh[Hugo_Symbol==gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+  
+tmp<-variantprobs::goodturing_probs(counts=v_f, m=num_samps)
+return(c("GT"=tmp %>% head(1), "SE"=attributes(tmp)$se[1]))
+}
+
+#select k nearest neighbor genes
+kNN_select<-function(gene, k){
+  return(c(names(sort(a[rownames(a)==gene,]))[1:(k)]))
+}
+
+kneigbor_GT_estimate<-function(genes){
+all_estimates<-lapply(genes, return_GT_SE)
+
+all_estimates_df<-as.data.frame(matrix(unlist(all_estimates), ncol=2, byrow=TRUE))
+colnames(all_estimates_df)<-c("est", "se")
+
+all_estimates_df<-rbind(all_estimates_df, c(mean(all_estimates_df[,1]), sd(all_estimates_df[,2])/sqrt(length(genes))))
+#if multiple genes
+if(length(genes)>1){
+  all_estimates_df$id<-c(genes, "pooled")
+  #calculate coefficient of variation and MSE
+  all_estimates_df<- all_estimates_df %>% mutate(coefvar=se/est) %>% mutate(mse=c(rep(0,length(genes)), sum((tail(all_estimates_df$est, 1)-head(all_estimates_df$est, 1))^2)))
+  return(c("pooled_coefvar"=tail(all_estimates_df$coefvar, 1), "pooled_sse"=tail(all_estimates_df$mse, 1)))}
+#if single gene
+else{
+  all_estimates_df<- all_estimates_df %>% mutate(coefvar=se/est) %>% mutate(mse=0)
+  return(c("pooled_coefvar"=all_estimates_df$coefvar[1], "pooled_mse"=all_estimates_df$mse[1]))
+}
+}
+
+
+mat<-matrix(ncol=2, nrow=10)
+for (i in 1:10){
+genes<-kNN_select("TP53",i)
+mat[i,]<-kneigbor_GT_estimate(genes)
+}
+
+mat<-cbind(mat, seq(1:10))
+mat<-as.data.frame(mat)
+colnames(mat)<-c("Coef_of_var", "SSE_wrt_TP53", "k")
+df<-melt(mat, id.vars="k")
+
+ggplot(df)+geom_line(aes(x=k, y=log2(value), color=variable), size=2)+theme_bw()+theme(panel.grid.minor = element_blank())+scale_color_discrete(name=element_blank(), breaks=c("Coef_of_var", "SSE_wrt_TP53"), labels=c("Coefficient of Variance", "Sum Squared Error WRT TP53"))+xlab("k: number of genes in pool")
+```
+
+
+# Pooling variants is not what we want
+```{r Pool variant pairs, eval=F}
+
+#large cohort
+filtered_variants<-tcga_nh %>% dplyr::group_by(Hugo_Symbol) %>% dplyr::filter(dplyr::n()/num_samps>0.005)
+
+#now define your gene list as filtered genes
+genelist<-filtered_variants$Hugo_Symbol %>% unique()
+
+#pull out columns that are easy to work with: average expression level, DNA replication time, average noncoding mutation freq, GC content, chromosomal compartment
+test_mat<-cbind(epigenetic_data$expression_CCLE, epigenetic_data$replication_time, epigenetic_data$noncoding_mutation_rate, logit(epigenetic_data$local_GC_content), epigenetic_data$HiC_compartment)
+#all should be in euclidian coordinates and scaled
+rownames(test_mat)<-epigenetic_data$gene
+colnames(test_mat)<-colnames(epigenetic_data[,5:9])
+
+#scale variables
+test_mat<-scale(test_mat, center=TRUE, scale=TRUE)
+test_mat<-test_mat[complete.cases(test_mat),]
+
+#filter for genes that appear in our cohort
+test_mat=test_mat[rownames(test_mat) %in% genelist,]
+
+#calculate pairwise differences
+distances=dist(test_mat, method="euclidian")
+a<-distances %>% as.matrix()
+
+nearest_neighbor<-c()
+for (i in 1:length(rownames(a))){
+  nearest_neighbor<-c(nearest_neighbor, sort(a[i,])[2])
+}
+
+#######
+#Nearest neighbor pairs
+#######
+nn<-cbind(rownames(a), names(nearest_neighbor))
+
+####
+#write function that computes mean GT estimate and SE(mean GT estimate) for gene pairs
+
+
+pair_GT_estimate<-function(genepair, plot=FALSE){
+  #GT probability first gene
+var_freq <- tcga_nh[Hugo_Symbol==genepair[1],
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+  
+b<-variantprobs::goodturing_probs(counts=v_f, m=num_samps)
+
+  #GT probability second gene
+var_freq <- tcga_nh[Hugo_Symbol==genepair[2],
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+  
+c<-variantprobs::goodturing_probs(counts=v_f, m=num_samps)
+
+  #pooled variants
+var_freq <- tcga_nh[Hugo_Symbol %in% genepair,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+
+d<-variantprobs::goodturing_probs(counts=v_f, m=num_samps)
+
+output=c("GT_pool"=d %>% head(1), "seGT_pool"=attributes(d)$se[1], "gene1est"=b %>% head(1), "gene1se"=attributes(b)$se[1], "gene2est"=c %>% head(1), "gene2se"=attributes(c)$se[1])
+
+if(plot==TRUE){
+test_pair<-data.frame(est=output[c(1,3,5)], se=output[c(2,4,6)], id=c("pooled", genepair))
+
+plt<-ggplot(test_pair) +
+    geom_bar(aes(x=factor(id, levels=c("pooled", genepair)) , y=est), stat="identity", fill="skyblue", alpha=0.7) +
+    geom_errorbar( aes(x=factor(id, , levels=c("pooled", genepair)), ymin=est-2*se, ymax=est+2*se), width=0.4, colour="orange", alpha=0.9, size=1.3)+theme_bw()+theme(panel.grid.major.x = element_blank(), panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank())+xlab(element_blank())+ylab("Good-Turing Probabilities")
+print(plt)}
+return(output)
+}
+
+pair_GT_estimate(genepair=nn[1,], plot=TRUE)
+
+#may take a few seconds
+res<-apply(FUN=pair_GT_estimate, MARGIN=1, X=nn)
+
+#generate density plots comparing pooled coefficients of variance vs single gene
+pooled_data<-as.data.frame(t(res))
+pooled_data$gene<-nn[,1]
+pool_1<-pooled_data[,c(2,4,6,7)] %>% melt()
+pool_2<-pooled_data[,c(1,3,5,7)] %>% melt()
+pooled_data<-cbind(pool_1, pool_2)
+pooled_data<-pooled_data[,c(1,2,3,6)]
+pooled_data$id<-ifelse(grepl("seGT_pool", pooled_data$variable), "pooled", ifelse(grepl("gene1", pooled_data$variable), "gene1", "gene2"))
+pooled_data<-pooled_data[,c(1,3,4,5)]
+colnames(pooled_data)<-c("gene", "se", "est", "id")
+
+ggplot(pooled_data)+geom_density(aes(x=se/est, fill=id, color=id), alpha=0.2)+theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+scale_fill_discrete(name  ="Gene Type", breaks=c("pooled", "gene1", "gene2"), labels=c("Pooled", "Gene1", "Gene2"))+guides(color = FALSE)+xlab("Coef of Variation")
+```
+
+```{r Pool k variants, eval=F}
+
+kneigbor_GT_estimate<-function(genes){
+
+output<-c()  
+
+  for (i in 1:length(genes)){
+  #GT probability first gene
+var_freq <- tcga_nh[Hugo_Symbol==genes[i],
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+  
+tmp<-variantprobs::goodturing_probs(counts=v_f, m=num_samps)
+output<-c(output, tmp %>% head(1), attributes(tmp)$se[1])
+}
+
+  #pooled variants
+var_freq <- tcga_nh[Hugo_Symbol %in% genes,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+
+d<-variantprobs::goodturing_probs(counts=v_f, m=num_samps)
+
+output<-c(output, "pooledGT"=d %>% head(1), "pooledGTse"=attributes(d)$se[1])
+
+return(output)
+}
+
+kNN_GT<-function(k){
+  #id nearest neighbors
+  knearest_neighbors<-matrix(nrow=length(rownames(a)), ncol=k)
+  for (i in 1:length(rownames(a))){
+    knearest_neighbors[i,]<-names(sort(a[i,]))[2:(k+1)]
+  }
+  
+  knn<-cbind(rownames(a), knearest_neighbors)
+  
+  pooled<-apply(X=knn, MARGIN=1, FUN=kneigbor_GT_estimate)
+  pooled<-t(as.matrix(pooled))
+  colnames(pooled)<-c(paste(c("gene", "segene"), rep(1:(k+1), each=2), sep=""), "pooled", "sepool")
+  
+  pooled_data<-as.data.frame(pooled)
+  pool_1<-pooled_data[,seq(1, length(colnames(pooled)), by=2)] %>% melt()
+  pool_2<-pooled_data[,seq(2, length(colnames(pooled)), by=2)] %>% melt()
+  pooled_data<-cbind(pool_1, pool_2)
+  pooled_data<-pooled_data[,c(1,2,4)]
+  colnames(pooled_data)<-c("id", "est", "se")
+
+ggplot(pooled_data)+geom_density(aes(x=se/est, fill=id, color=id), alpha=0.2)+theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+scale_fill_discrete(name  ="Gene Type", breaks=c("pooled", paste("gene", 1, sep="")), labels=c("Pooled", "Single Gene"))+guides(color = FALSE)+xlab("Coef of Variation")
+}
+
+#run where each gene's variants are pooled with 3 nearest genes in metafeature space
+kNN_GT(k=3)
+```
+
+
+```{r Validating Gene pair pooling on MSKImpact test set}
+data(impact)
+
+View(impact)
+```
+
+
+

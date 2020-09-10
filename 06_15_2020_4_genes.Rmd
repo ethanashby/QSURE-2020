@@ -1,0 +1,281 @@
+---
+title: "06/15/2020 Four Select Genes"
+author: "Ethan Ashby"
+date: "6/13/2020"
+output:
+  pdf_document: default
+  word_document: default
+---
+# Overview
+Implement suite of varprobs functions on four GOI: KRAS, TP53, BRAF, FAT1.
+
+
+```{r chunk options packages functions, include=FALSE, cache=TRUE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	fig.height = 6,
+	fig.width = 8,
+	message = FALSE,
+	warning = FALSE,
+	comment = NA,
+	results = "hide",
+	cache = TRUE,
+	fig.keep="none"
+)
+
+library(devtools)
+library(tidyverse)
+library(data.table)
+install_github("https://github.com/c7rishi/variantprobs.git")
+library(variantprobs)
+load("./tcga.rda")
+load("./impact.rda")
+library(rvest)
+library(reshape)
+library(boot)
+library(knitr)
+library(kableExtra)
+
+data(tcga)
+tcga <- data.table::setDT(tcga)
+
+#function to calculate bootstrapped unseen variant probabilities
+GTboot_probs<-function(counts, indices, m=num_samps){
+  data=counts[indices]
+  return(goodturing_probs(counts=data, m=num_samps) %>% tail(1))
+}
+```
+
+```{r TP53, cache=TRUE}
+# calculate variant frequencies for TP53
+var_freq <- tcga[Hugo_Symbol == "TP53",
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+v_f <- var_freq$v_f
+names(v_f) <- var_freq$Variant
+num_samps <- length(unique(tcga$patient_id))
+
+#histogram of N_r's
+var_freq %>% ggplot()+geom_histogram(aes(x=v_f), binwidth=1)+theme_bw()+ggtitle("N_r distribution for TP53")+xlab("N_r")
+
+#####
+#How does delta(t) change with t? How does SE(delta(t)) change?
+#####
+
+#delta(t)
+vec<-c()
+for (i in 1:length(seq(0.1,10,0.1))){
+vec<-c(vec, variantprobs::sgt_Delta(counts=v_f, m=num_samps, t=seq(0.1,10,0.1)[i]))
+}
+plot(seq(0.1,10,0.1), vec, "l", xlab="t", ylab="∆t", main="Smooth Good-Toulim ∆t as a function of t for TP53")
+abline(v=log10(num_samps), col="blue")
+legend(8, 250, legend=c("log(m)"), col=c("blue"), lty=1, cex=0.8)
+
+
+#SE
+vec<-c()
+for (i in 1:length(seq(0.1,10,0.1))){
+vec<-c(vec, attributes(variantprobs::sgt_Delta(counts=v_f, m=num_samps, t=seq(0.1,10,0.1)[i]))$se)
+}
+
+plot(seq(0.1,10,0.1), vec, "l", xlab="t", ylab="SE", main="SE of ∆t as a function of t for TP53")
+
+#####
+#Good Turing probs
+#####
+
+#good turing estimate given our data
+goodturing_probs(counts=v_f, m=num_samps) %>% tail(1)
+
+#bootstrap the variant frequencies and calculate SE, CI & such
+boot_res<-boot(data=v_f, statistic=GTboot_probs, R=1000)
+
+#bias
+mean(boot_res$t)-boot_res$t0
+
+#bootstrap SE
+sd(boot_res$t)
+
+plot(boot_res)
+boot.ci(boot_res, type=c("norm", "basic", "perc", "bca"))
+```
+
+```{r KRAS, cache=TRUE}
+# calculate variant frequencies for KRAS
+var_freq <- tcga[Hugo_Symbol == "KRAS",
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+v_f <- var_freq$v_f
+names(v_f) <- var_freq$Variant
+num_samps <- length(unique(tcga$patient_id))
+
+#histogram of N_r's
+var_freq %>% ggplot()+geom_histogram(aes(x=v_f), binwidth=1)+theme_bw()+ggtitle("N_r distribution for TP53")+xlab("N_r")
+
+#####
+#How does delta(t) change with t? How does SE(delta(t)) change?
+#####
+
+#delta(t)
+vec<-c()
+for (i in 1:length(seq(0.1,10,0.1))){
+vec<-c(vec, variantprobs::sgt_Delta(counts=v_f, m=num_samps, t=seq(0.1,10,0.1)[i]))
+}
+plot(seq(0.1,10,0.1), vec, "l", xlab="t", ylab="∆t", main="Smooth Good-Toulim ∆t as a function of t for TP53")
+abline(v=log10(num_samps), col="blue")
+legend(8, 250, legend=c("log(m)"), col=c("blue"), lty=1, cex=0.8)
+
+
+#SE
+vec<-c()
+for (i in 1:length(seq(0.1,10,0.1))){
+vec<-c(vec, attributes(variantprobs::sgt_Delta(counts=v_f, m=num_samps, t=seq(0.1,10,0.1)[i]))$se)
+}
+
+plot(seq(0.1,10,0.1), vec, "l", xlab="t", ylab="SE", main="SE of ∆t as a function of t for TP53")
+
+#####
+#Good Turing probs
+#####
+
+#good turing estimate given our data
+goodturing_probs(counts=v_f, m=num_samps) %>% tail(1)
+
+#bootstrap the variant frequencies and calculate SE, CI & such
+boot_res<-boot(data=v_f, statistic=GTboot_probs, R=1000)
+
+#bias
+mean(boot_res$t)-boot_res$t0
+
+#bootstrap SE
+sd(boot_res$t)
+
+plot(boot_res)
+boot.ci(boot_res, type=c("norm", "basic", "perc", "bca"))
+```
+
+```{r Any gene that your heart desires!, cache=TRUE}
+plot_Nrs<-function(gene, counts){
+  hist(counts$v_f, breaks=seq(1, max(counts$v_f), 1), main=paste("N_r distribution for", gene, sep=" "), xlab="N_r", ylab="Frequency")
+}
+
+######
+#gene assessment takes in a gene name, and two boolean arguments and outputs the proportion of singleton variants, the Good-Turing Probability of yielding at least one new (unseen) variant in that gene in a random tumor sample, and the bootstrapped bias and SE for these Good-Turing Estimates
+gene_assessment<-function(gene, ci=FALSE, plot=FALSE){
+  #initialize results object
+  output<-c()
+  
+  var_freq <- tcga[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+  names(v_f) <- var_freq$Variant
+  num_samps <- length(unique(tcga$patient_id))
+  
+  ####
+  #output prop singleton
+  ####
+  prop_singleton=sum(v_f==1)/sum(v_f)
+  names(prop_singleton)="Prop Singleton"
+  output<-c(output, prop_singleton)
+  
+  #histogram of N_r's
+  if(plot==TRUE){plot_Nrs(gene=gene, counts=var_freq)}
+  
+  #####
+  #delta(t): Good-Toulmin estimates
+  #####
+  
+  #chao estimate of total # unseen variants
+  chao<-variantprobs::chao_N0(counts=var_freq$v_f, m=num_samps)
+  
+  output<-c(output, c("Chao est"= chao[1]), attributes(chao) %>% unlist() %>% rename(replace=c("se"="SE Chao")))
+  
+  #good toulmin w/ t=1
+  
+  good_toulmin<-variantprobs::sgt_Delta(var_freq$v_f, m=num_samps, t=1)
+  
+  output<-c(output, c("Good-Toulmin est t=1"= good_toulmin[1]), attributes(good_toulmin) %>% unlist() %>% rename(replace=c("se"="SE Good-Toulmin t=1")))
+  
+
+  #delta(t) plot as function of t
+  vec<-c()
+  for (i in 1:length(seq(0.1,10,0.1))){
+  vec<-c(vec, variantprobs::sgt_Delta(counts=v_f, m=num_samps, t=seq(0.1,10,0.1)[i]))
+  }
+  
+  if(plot==TRUE){
+  plot(seq(0.1,10,0.1), vec, "l", xlab="t", ylab="∆t", main=paste("Smooth Good-Toulmin ∆t as a function of t for", gene, sep=" "))
+  abline(v=log10(num_samps), col="blue")
+  legend(8, 250, legend=c("log(m)"), col=c("blue"), lty=1, cex=0.8)
+  }
+
+  #SE(delta(t)) plot as function of t
+  vec<-c()
+  for (i in 1:length(seq(0.1,10,0.1))){
+  vec<-c(vec, attributes(variantprobs::sgt_Delta(counts=v_f, m=num_samps, t=seq(0.1,10,0.1)[i]))$se)
+  }
+  
+  if(plot==TRUE){
+  plot(seq(0.1,10,0.1), vec, "l", xlab="t", ylab="SE", main=paste("SE of ∆t as a function of t for", gene, sep=" "))
+  abline(v=log10(num_samps), col="blue")
+  legend(8, 250, legend=c("log(m)"), col=c("blue"), lty=1, cex=0.8)}
+
+  #####
+  #Good Turing probs
+  #####
+
+  #good turing estimate given our data
+  output<-c(output, goodturing_probs(counts=v_f, m=num_samps) %>% tail(1))
+
+  #bootstrap the variant frequencies and calculate SE, CI & such
+  boot_res<-boot(data=v_f, statistic=GTboot_probs, R=1000)
+
+  #bias
+  output<-c(output, rename(mean(boot_res$t)-boot_res$t0, c("atleast_1new"="bias Good-Turing")))
+
+  #bootstrap SE
+  SE=sd(boot_res$t)
+  names(SE)<-"SE Good-Turing"
+  output<-c(output, SE)
+
+  if(plot==TRUE){plot(boot_res)}
+  if(ci==TRUE){boot.ci(boot_res, type=c("norm", "basic", "perc", "bca"))}
+  
+  return(output)
+}
+```
+
+```{r Assess, cache=TRUE, fig.keep="all"}
+KRAS<-gene_assessment(gene="KRAS")
+TP53<-gene_assessment(gene="TP53")
+BRAF<-gene_assessment(gene="BRAF")
+FAT1<-gene_assessment(gene="FAT1")
+
+####
+#plot Good Turing Probabilities w/ bootstrapped CIs
+####
+
+plot_df<-rbind(KRAS, TP53, BRAF, FAT1)
+plot_df<-as.data.frame(plot_df)
+plot_df$gene<-rownames(plot_df)
+
+ggplot(plot_df)+geom_bar(aes(x=gene, y=atleast_1new), stat="identity", fill="skyblue", alpha=0.7)+geom_errorbar(aes(x=gene, ymin=(atleast_1new-1.96*`SE Good-Turing`), ymax=(atleast_1new + 1.96*`SE Good-Turing`)), color="orange")+theme_bw()+ggtitle("Good-Turing Estimates (95% Normal Bootstrap CI)")+xlab("Genes")+ylab("P(at least one unseen variant)")+theme(panel.grid.major.x = element_blank(), panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank())
+
+###
+#plot Good Toulmin and Chao estimates
+###
+
+#chao
+ggplot(plot_df)+geom_bar(aes(x=gene, y=`Chao est`), stat="identity", fill="skyblue", alpha=0.7)+geom_errorbar(aes(x=gene, ymin=(`Chao est`-1.96*`SE Chao`), ymax=(`Chao est` + 1.96*`SE Chao`)), color="orange")+theme_bw()+ggtitle("Chao Estimates of Total Number of Unseen Variants (95% Normal CI)")+xlab("Genes")+ylab("Num Unseen Variants")+theme(panel.grid.major.x = element_blank(), panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank())
+
+#Good Toulmin
+ggplot(plot_df)+geom_bar(aes(x=gene, y=`Good-Toulmin est t=1`), stat="identity", fill="skyblue", alpha=0.7)+geom_errorbar(aes(x=gene, ymin=(`Good-Toulmin est t=1`-1.96*`SE Good-Toulmin t=1`), ymax=(`Good-Toulmin est t=1` + 1.96*`SE Good-Toulmin t=1`)), color="orange")+theme_bw()+ggtitle("Good-Toulmin Estimates of New Variants Detections (t=1) (95% Normal CI)")+xlab("Genes")+ylab("Num New Variants")+theme(panel.grid.major.x = element_blank(), panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank())
+```
+
+```{r, results="show", fig.keep="all"}
+tbl<-rbind(gene_assessment(gene="KRAS"), gene_assessment(gene="TP53"), gene_assessment(gene="FAT1"), gene_assessment(gene="BRAF"))
+rownames(tbl)<-c("KRAS", "TP53", "FAT1", "BRAF")
+knitr::kable(tbl) %>% kable_styling(latex_options="scale_down")
+```
+

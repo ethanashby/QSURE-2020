@@ -1,0 +1,222 @@
+---
+title: "6_17_2020 all genes"
+author: "Ethan Ashby"
+date: "6/15/2020"
+output: pdf_document
+---
+
+# Overview
+According to Saptarshi, bootstrapping the frequencies (as performed in '06_15_2020_4_genes.Rmd') works for generating SE estimates for seen mutations, but does not extend to SE for unseen mutations. Thus, if we chose to pursue a bootstrap method, we would have to conduct a parametric bootstrap, which assumes that each of the $N_r$'s are modeled. by a Poisson distribution. \newline
+
+We know that the Good-Turing Probabilities for at least one variant is directly a function of $N_1$. What about the SE? \newline
+
+Goal: generate Good-Turing estimates for all genes in the TCGA dataset (non-hypermutated samples) that appear at some frequency threshold (relative freq>0.1 or >10 occurrences). Keep track of SE's and plot against $N_1$ or rare variants ($\sum{N_r}$ for $r=1,2,3$). Also keep track of the number of times we achieve a problematic slope estimate (b>-1).
+
+# Installing new variantprobs package
+Took some finagling. I updated R, the commandline tools. But ultimately it took deleting a 'Makevars' file from '~/usr/.R' to get the package to compile.
+
+```{r chunk options packages functions, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	fig.height = 5,
+	fig.width = 7,
+	message = FALSE,
+	warning = FALSE,
+	comment = NA,
+	results = "hide",
+	cache = TRUE,
+	fig.keep="none"
+)
+
+library(dplyr)
+library(magrittr)
+library(knitr)
+library(devtools)
+library(magrittr)
+library(tidyverse)
+library(data.table)
+#options(buildtools.check = function(action) TRUE )
+#install_github("https://github.com/c7rishi/variantprobs.git")
+library(variantprobs)
+library(rvest)
+library(reshape)
+library(boot)
+library(knitr)
+library(kableExtra)
+library(parallel)
+library(e1071)
+library(drc)
+
+data(tcga)
+
+#filter only non-hypermutated genes
+tcga_nh <- data.table::setDT(tcga) %>% filter(MS=="Non-hypermutated")
+```
+
+# goodTuring_SE function
+I wrote a function which takes in a gene name, and then outputs a list with four elements: (i) a vector of good-turing probabilities for all seen and unseen variants, (ii) the Chao estimate of N0, (iii) the SE of the Good-Turing estimates, (iv) whether the smoothing algorithm provided a logical beta estimate. 
+I used the function 'mclapply' with 8 cores to apply this function over a list of genes with a mutation rate >0.03 (as in the original Somatic Variant richness paper). Runtime was fast and the output was a list containing all the above information.
+
+```{r goodTuring_SE function}
+goodTuring_SE<-function(gene){
+#obtain variant frequencies
+var_freq <- tcga_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+v_f <- var_freq$v_f
+names(v_f) <- var_freq$Variant
+num_samps <- length(unique(tcga_nh$patient_id))
+
+#run goodturing
+GToutput<-goodturing_probs(counts=v_f, m=num_samps)
+
+#output in lis
+output<-list("good_turing"=c(GToutput), "chao"=attributes(GToutput)$N0, "good_turing_se"=attributes(GToutput)$se, "reliable_beta"=attributes(GToutput)$smooth_slope_ok)
+
+output
+}
+
+#####
+#Practice on tiny list
+#####
+
+#genelist<-c("KRAS", "TP53")
+#mclapply parallelizes apply over gene list for fast goodTuring estimation
+#res<-c(mclapply(genelist, goodTuring_SE, mc.cores=8))
+#names(res)<-genelist
+```
+
+```{r, echo=TRUE}
+#####
+#Filter genes w/ frequency>0.03
+#####
+
+num_samps<-length(unique(tcga_nh$patient_id))
+#filter variants where mutation rate (num_variants/num_samples)>0.03
+filtered_variants<-tcga_nh %>% dplyr::group_by(Hugo_Symbol) %>% dplyr::filter(dplyr::n()/num_samps>0.03)
+
+#this produces 858 genes
+filtered_variants$Hugo_Symbol %>% unique() %>% length()
+
+#now define your gene list as these filtered genes
+genelist<-filtered_variants$Hugo_Symbol %>% unique()
+#takes ~10 seconds to run
+variant_stats<-c(mclapply(genelist, goodTuring_SE, mc.cores=8))
+names(variant_stats)<-genelist
+```
+
+# Exploring results
+Of our `r length(variant_stats)` genes with adequate mutation rate, `r length(variant_stats)` achieved acceptable Good-Turing estimates ($\beta <-1$).
+
+```{r barplot SE, fig.keep="all", fig.cap="Barplot of ordered Good-Turing standard errors for 45 genes that met mutation frequency criteria"}
+#how many genes show reliable betas?
+counter=0
+for (i in 1:length(variant_stats)){
+  if(variant_stats[[i]]$reliable_beta==TRUE){counter=counter+1}
+}
+counter
+
+#what do Good-Turing Probabilities and SE Probabilities Look like
+SEvec<-c()
+for (i in 1:length(variant_stats)){
+  SEvec<-c(SEvec, variant_stats[[i]]$good_turing_se %>% tail(1))
+}
+
+###barplot of SE
+names(SEvec)<-genelist
+barplot(height=sort(SEvec,decreasing=TRUE), ylab="SE Good-Turing", las=2)
+
+#barplot(height=c(SEvec %>% sort(decreasing=TRUE) %>% head(5), SEvec %>% sort(decreasing=TRUE) %>% tail(5)), main="Ten Most Extreme Good-Turing Standard Errors", ylab="SE Good-Turing", las=2)
+```
+
+```{r Density SE, fig.keep="last", fig.cap="Right-skewed density of Good-Turing Standard Errors"}
+###Density plot of SE
+plot(density(SEvec), xlab="SE of Good-Turing Estimates", main="")
+legend(0.0035, 1200, paste("Kurtosis", round(kurtosis(SEvec), 2), "\n", "Skewness", round(skewness(SEvec), 2)), adj = c(0, 0.5), x.intersp = -0.5, # adjust character interspacing as you like to effect box width
+    y.intersp = 1)
+```
+
+The majority of Good-Turing standard errors fell within [0.002, 0.003] (*Figure 1*). A density plot of the Good-Turing standard errors shows positive kurtosis `r kurtosis(SEvec)`(relatively less weight in tails) a slight right-skew `r skewness(SEvec)` (*Figure 2*.)
+
+A plot of the Good-Turing standard errors against the gene-wise $N_1$ values indicated that these standard errors are a logarithmic function of $N_1$ (*Figure 3*).
+
+```{r N_1 vs SE Good-Turing, fig.keep="last", fig.cap="Relationship between N_1 and SE of Good-Turing Unseen Variants Probabilities"}
+#function to extract N's
+N_return<-function(gene, thresh=1){
+  #obtain variant frequencies
+  var_freq <- tcga_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+  N=sum(v_f %in% seq(1,thresh,1))
+  N
+}
+
+#got N_1's
+N_1<-mclapply(genelist, N_return, thresh=1, mc.cores=8)
+N_1<-unlist(N_1)
+
+d=data.frame(n1=N_1, se=SEvec)
+d=d[order(d$se),]
+
+mL<-drm(se ~ n1, data = d, fct = LL2.3(), type = "continuous")
+plot(N_1, SEvec, "p", col="red", ylab="SE of Good-Turing Probabilities", xlab="N_1")
+with(d[c(1,2,3,4,5,6, 10, 20, 30, 40, 44, 45),], text(se~n1, labels =rownames(d[c(1,2,3,4,5,6, 10, 20, 30, 40, 44, 45),]), cex=0.8, pos = 4))
+lines(x=seq(1,max(N_1),1), y=predict(mL, newdata=data.frame(n1=seq(1,max(N_1),1))), col="blue")
+#lines(x=seq(0,max(N_1), 1), y=two_param(x=seq(0,max(N_1),1), b=-0.611103, e=7.319632))
+
+summary(mL)
+print(mL$coefficients[1] %>% as.numeric)
+
+two_param<-function(x,b,e){
+  1/(1+exp(b*(log(x)-e)))
+}
+
+```
+
+To further investigate this, I fit a variety of logarithmic functions to these data using the `r print("drm")` package in R. The best fit I obtained was a Log-logistic function with 3 parameters, that practically interpolated the data (sum of squared residuals=`r mL$predres[,2]^2 %>% sum()`). 
+
+$$
+f(x) = 0 + \frac{d-0}{1+\exp(b*(\log(x)-e))}
+$$
+
+The parameter values for log-logistic function are shown in the table below.
+
+```{r, include=TRUE}
+parms_table<-t(mL$parmMat)
+colnames(parms_table)<-c("b", "d", "e")
+knitr::kable(parms_table, "latex")
+```
+
+
+I validated that my bootstrap method which samples variant frequencies does not perform well at capturing the SE of P(one or more unseen variant).
+
+```{r how does my bootstrap SE method do?, eval=F}
+
+GTboot_probs<-function(counts, indices, m=num_samps){
+  data=counts[indices]
+  return(goodturing_probs(counts=data, m=num_samps) %>% tail(1))
+}
+
+boot_assessment<-function(gene){
+var_freq <- tcga_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+v_f <- var_freq$v_f
+names(v_f) <- var_freq$Variant
+num_samps <- length(unique(tcga_nh$patient_id))
+
+#good turing estimate given our data
+se=unname(attributes(goodturing_probs(counts=v_f, m=num_samps))$se %>% tail(1))
+
+#bootstrap the variant frequencies and calculate SE, CI & such
+boot_res<-boot(data=v_f, statistic=GTboot_probs, R=1000)
+boot_est<-boot_res$t %>% sd()
+return(c("se"=se, "boot_se"=boot_est))
+}
+
+short_list<-tail(genelist, 20)
+se_differences<-mclapply(short_list, boot_assessment, mc.cores=8)
+```
+
+

@@ -1,0 +1,200 @@
+---
+title: "6_24_2020_kmeans_metafeature_clustering"
+author: "Ethan Ashby"
+date: "6/23/2020"
+output: html_document
+---
+
+# Overview
+
+Group genes into metafeatures in the predictor space, pool variants, calculate Good-Turing probabilities for all the different cancer types, and repeat to try and identify clusters that maximize NMI w/ tissue type.
+
+```{r}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	fig.height = 5,
+	fig.width = 7,
+	message = FALSE,
+	warning = FALSE,
+	comment = NA,
+	results = "hide",
+	cache = TRUE,
+	fig.keep="all"
+)
+
+library(dplyr)
+library(magrittr)
+library(knitr)
+library(devtools)
+library(magrittr)
+library(tidyverse)
+library(data.table)
+#options(buildtools.check = function(action) TRUE )
+#install_github("https://github.com/c7rishi/variantprobs.git")
+library(variantprobs)
+library(rvest)
+library(reshape)
+library(boot)
+library(knitr)
+library(kableExtra)
+library(parallel)
+library(e1071)
+library(drc)
+library(plotly)
+library(spatstat.utils)
+library(DescTools)
+library(GGally)
+library(parallel)
+library(lattice)
+
+data(tcga)
+
+tcga_nh <- data.table::setDT(tcga) %>% filter(MS=="Non-hypermutated")
+
+tcga_genelist<-tcga_nh$Hugo_Symbol %>% unique()
+```
+
+```{r}
+#remove empty rows at the end
+epigenetic_data<-read.csv("covariate-table.csv", header=TRUE)
+epigenetic_data<-epigenetic_data[epigenetic_data$gene!="",]
+
+#create space of epigenetic predictors, Z scale predictors
+cluster_space<-cbind(epigenetic_data$expression_CCLE, epigenetic_data$replication_time, epigenetic_data$noncoding_mutation_rate, epigenetic_data$local_GC_content, epigenetic_data$HiC_compartment)
+rownames(cluster_space)<-epigenetic_data$gene
+cluster_space<-cluster_space[complete.cases(cluster_space),]
+cluster_space<-scale(cluster_space)
+cluster_space<-as.data.frame(cluster_space)
+colnames(cluster_space)<-c("expression", "rep_time", "nc_mut_rate", "loc_GC_cont", "HiC")
+
+#filter cluster space by only genes in tcga: 15780 genes intersect
+cluster_space<-cluster_space[rownames(cluster_space) %in% tcga_genelist, ]
+```
+
+```{r fig.keep="all"}
+#33 cancer types
+unique_cancer_types<-tcga_nh$Cancer_Code %>% unique()
+unique_cancer_types<-unique_cancer_types[!is.na(unique_cancer_types)]
+
+data.table::setDT(epigenetic_data)
+
+#adapt GT metagene function to standardize for gene length, returns GT prob per MB
+GT_metagene_vec<-function(genes){
+  #metagene cluster length
+  clust_length=epigenetic_data[gene %in% genes, .(length=sum(end-start))] %>% as.numeric()
+  
+  #get variants
+  varpool<-tcga_nh[Cancer_Code %in% unique_cancer_types]
+  #obtain variant frequencies
+  var_freq <- varpool[Hugo_Symbol %in% genes,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant, Cancer_Code)]
+  
+  #calculate sample size for each gene and join with variant freqs
+  n_samps<-varpool %>% group_by(Cancer_Code) %>% summarize(num_samps= patient_id %>% unique() %>% length())
+  var_freq<-left_join(var_freq, n_samps, by='Cancer_Code')
+  
+  #Good-turing calculation
+  GT<-var_freq %>% group_by(Cancer_Code) %>% summarize(GT=goodturing_probs(counts=v_f, m=num_samps) %>% head(1)) %>% as.data.table()
+  
+  missing_codes<-setdiff(unique_cancer_types, GT$Cancer_Code)
+  tmp_mat<-data.table(missing_codes, 0)
+  if(length(missing_codes) !=0) GT<-rbind(GT, tmp_mat, use.names=FALSE)
+  GT<-GT[order(Cancer_Code),]
+  
+  GTperMB<-GT$GT *1e6/clust_length
+  names(GTperMB)<-GT$Cancer_Code
+  return(GTperMB)
+}
+
+#smaller example, n_iter=10, k=50
+
+prob_array_return<-function(n_iter=10, k=50){
+  
+  #list of outputs
+  output_array<-array(dim=c(k, length(unique_cancer_types), n_iter))
+  output<-vector("list", length=n_iter)
+  
+  #loop through clustering procedure
+  for (i in 1:n_iter){
+    print(paste(i, "iterations"))
+    km.res <- kmeans(cluster_space, k, nstart = 1, iter.max=20)
+    tmp_list<-split(names(km.res$cluster), cut(km.res$cluster, 0:k))
+    names(tmp_list)<-seq(1:k)
+    
+    Lx=tmp_list
+    output_slice<-mclapply(tmp_list, GT_metagene_vec, mc.cores=7) %>% unlist()
+    output_slice<-matrix(output_slice, ncol=length(unique_cancer_types), nrow=k)
+    
+    output[[i]]<-output_slice
+    attr(output[[i]], "genes")<-tmp_list
+    #output_array[,,i]<-output_slice
+  }
+  
+return(output)
+}
+
+output_array<-prob_array_return(n_iter=5, k=50)
+
+ran_calc<-function(slice_index, clust_index){
+  res<-lapply(attributes(output_array[[2]])$genes, FUN=intersect, y=attributes(output_array[[1]])$genes[[1]])
+  RRand()
+}
+for (i in 1:50){
+  set1<-attributes(output_array[[1]])$genes[[50]]
+  topset<-attributes(output_array[[2]])$genes[[45]]
+  to_beat<-length(intersect(set1, topset))
+  for (j in 2:50){
+    set2<-attributes(output_array[[2]])$genes[[j]]
+    to_beat<-ifelse(length(intersect(set1, set2))>to_beat, length(intersect(set1, set2)), to_beat)
+  }
+}
+
+
+####
+#We need probabilities of getting a particular tissue types
+####
+
+
+#tcga_nh is the tcga dataset filtered by MS is non-hypermutated
+#output_array is the output of my clustering and good-turing calculation function. It is a [50, 32, 20] array, where 50 corresponds to k (the number of metagene clusters), 32 corresponds to the number of cancer types in the non-hypermutated TCGA dataset, and 20 corresponds to the number of clustering iterations. An entry [i,j,k] of the array corresponds to the Good-Turing probability estimate for metagene cluster i, for cancer type j, for iteration k.
+
+#calculate probabilities of different cancers: proportion of tumors of particular cancer type the non-hypermutated cohort
+cancer_probs<-tcga_nh %>% group_by(Cancer_Code) %>% select(patient_id) %>% unique() %>% summarize(n=n()) %>% mutate(Prob=n/sum(n))
+cancer_probs<-cancer_probs[match(unique_cancer_types, cancer_probs$Cancer_Code),]
+
+####
+#NMI_return
+#returns NMI for a particular metagene cluster and a particular iteration
+
+log_helper<-function(x){ifelse(x==0, 0, log10(x))}
+
+NMI_return<-function(row_index, slice_index){
+  
+#calculate mutual information for metagene group
+MI=sum(output_array[[slice_index]][row_index,]*cancer_probs$Prob*log_helper(output_array[[slice_index]][row_index,]/sum(output_array[[slice_index]][row_index,]*cancer_probs$Prob)))+sum((1-output_array[[slice_index]][row_index,])*cancer_probs$Prob*log_helper((1-output_array[[slice_index]][row_index,])/sum((1-output_array[[slice_index]][row_index,])*cancer_probs$Prob)))
+
+#Shannon entropy of GT probabilities
+Hx=sum(log_helper(sum(output_array[[slice_index]][row_index,]*cancer_probs$Prob))*output_array[[slice_index]][row_index,]*cancer_probs$Prob)+sum(log_helper(sum((1-output_array[[slice_index]][row_index,])*cancer_probs$Prob))*(1-output_array[[slice_index]][row_index,])*cancer_probs$Prob)
+
+#Shannon entropy of cancer probabilities
+Hc=sum(log_helper(cancer_probs$Prob)*cancer_probs$Prob)
+
+NMI=MI/sqrt(Hx*Hc)
+NMI
+}
+
+to_plot<-matrix(ncol=5, nrow=50)
+for (j in 1:5){
+  for (i in 1:50){
+    to_plot[i,j]<-NMI_return(row_index=i, slice_index = j)
+  }
+}
+
+to_plot
+```
+
+```{r fig.keep="all"}
+levelplot(to_plot, xlab="Clusters", ylab="iteration", col.regions=viridisLite::cividis(100))
+```
+

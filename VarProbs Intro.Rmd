@@ -5,6 +5,37 @@ date: "6/4/2020"
 output: pdf_document
 ---
 
+<<<<<<< HEAD
+# Really useful resources
+https://docs.gdc.cancer.gov/Data/File_Formats/MAF_Format/
+https://begin4learn.gitbooks.io/note-of-cancer-tcga-data-analysis/content/Tools/TCGACodeTables/TCGAStudyAbbreviations.html
+
+```{bash}
+curl https://dcc.icgc.org/api/v1/ui/software/icgc-get/linux/latest -o icgc-get.latest.zip -L
+
+unzip icgc-get.latest.zip
+```
+```{bash}
+#install pyinstaller
+cd ~
+wget https://github.com/pyinstaller/pyinstaller/releases/download/v3.2/PyInstaller-3.2.tar.gz
+tar zxvf PyInstaller-3.2.tar.gz
+cd PyInstaller-3.2/bootloader
+./waf all
+cd ..
+chmod a+x setup.py install
+python setup.py install --user || exit 1
+```
+
+```{bash}
+chmod a+x ./icgc-get
+./icgc-get -configure --mmacosx-version-min=10.1
+```
+
+
+
+=======
+>>>>>>> parent of b183246... Foray into TCGA Data Wrangling and variant count generation
 ```{r Packages, cache=TRUE}
 library(devtools)
 library(tidyverse)
@@ -30,10 +61,89 @@ names(v_f) <- var_freq$Variant
 m <- length(unique(tcga$patient_id))
 
 # Good Turing estimates
-goodturing_probs(counts = v_f, m = m)
+var_freq <- tcga[Hugo_Symbol == "KRAS",
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant, Cancer_Code)]
+
+res<-c()
+for (i in 1:length(unique(var_freq$Cancer_Code))){
+res<-c(res,  goodturing_probs(counts = var_freq %>% filter(Cancer_Code==unique(var_freq$Cancer_Code)[i]) %>% select(4) %>% c() %>% unlist(), m = m) %>% tail(1))
+}
+names(res)<-unique(var_freq$Cancer_Code)
+res<-data.frame(prob=res, type=names(res), gene="KRAS")
+
+res %>% arrange(type) %>% ggplot()+geom_point(aes(x=as.factor(type), y=gene, size=prob, color=prob))+scale_color_gradient(low="blue", high="red")+theme_bw()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
 
 #how are these two different?
 sgt_Delta(counts = v_f, m = m)
 chao_N0(counts = v_f, m = m)
+<<<<<<< HEAD
+
+
+
+
+
+#########
+#TEST DATA
+#########
+#read in .maf file and filter out sex linked (germline) variants
+maf<-read.maf("./TCGA.BRCA.mutect.995c0111-d90b-4140-bee7-3845436c3b42.DR-10.0.somatic.maf")
+maf1<- maf@data
+maf2<-maf1 %>% filter(VARIANT_CLASS=="SNV") %>% distinct()
+
+#create dataframe with relevant information
+test_data<-data.frame(Hugo_Symbol=maf2$Hugo_Symbol, Variant= paste(maf2$Hugo_Symbol, gsub("chr", "", maf2$Chromosome),maf2$Start_Position, maf2$Tumor_Seq_Allele1, maf2$Tumor_Seq_Allele2, sep="_"), patient_id=substr(maf2$Tumor_Sample_Barcode, start=1, stop=16), TSS=cancer_type_table$`Study Abbreviation`[match(substr(maf2$Tumor_Sample_Barcode, start=6, stop=7), cancer_type_table$`TSS Code`)])
+
+View(test_data)
+
+#convert to data table
+test_data<-data.table(test_data)
+
+####
+#BRCA data
+####
+
+var_freq <- test_data[,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+
+counts<-var_freq %>% group_by(v_f) %>% tally()
+ggplot(counts, aes(x=v_f, y=log(n)))+geom_bar(stat="identity")+ggtitle("N_r distribution for 985 BRCA Tumors")
+
+var_freq %>% group_by(Hugo_Symbol) %>% summarise(val=goodturing_probs(counts= v_f, m = m))
+
+m=test_data$patient_id %>% unique() %>% length()
+
+vec<-c()
+for (i in 1:length(unique(var_freq$Hugo_Symbol))){
+  print(i)
+vec<-c(vec, var_freq[var_freq$Hugo_Symbol==unique(var_freq$Hugo_Symbol)[i]]$v_f %>% goodturing_probs(counts= , m = m) %>% extract2(1))
+}
+names(vec)<-unique(var_freq$Hugo_Symbol)[1:length(unique(var_freq$Hugo_Symbol))]
+vec<-data.frame(vec, gene=names(vec), type=rep("BRCA",length(unique(var_freq$Hugo_Symbol))))
+colnames(vec)<-c("Prob", "gene", "type")
+vec %>% arrange(desc(Prob)) %>% head(25) %>% ggplot()+geom_point(aes(x=as.factor(type), y=reorder(gene, Prob), size=Prob, color=Prob))+scale_color_gradient(low="blue", high="red")
+
+
+=======
+>>>>>>> parent of b183246... Foray into TCGA Data Wrangling and variant count generation
 ```
+
+
+```{r Playing around with maftools}
+#summary
+plotmafSummary(maf)
+
+#oncoplot
+oncoplot(maf)
+
+#rainfall plot
+rainfallPlot(maf, detectChangePoints = TRUE, pointSize = 0.4)
+
+#somatic interactions
+somaticInteractions(maf = maf, top=25, pvalue=c(0.01, 0.05, 0.1))
+```
+
+
 

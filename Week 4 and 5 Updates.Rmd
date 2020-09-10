@@ -1,0 +1,672 @@
+---
+title: "6_29_2020_week4_readjustclustering"
+author: "Ethan Ashby"
+date: "6/26/2020"
+output: html_document
+---
+
+## Packages
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	fig.height = 5,
+	fig.width = 7,
+	message = FALSE,
+	warning = FALSE,
+	comment = NA,
+	results = "hide",
+	cache = TRUE,
+	fig.keep="all"
+)
+
+library(dplyr)
+library(magrittr)
+library(knitr)
+library(devtools)
+library(magrittr)
+library(tidyverse)
+library(data.table)
+#options(buildtools.check = function(action) TRUE )
+#install_github("https://github.com/c7rishi/variantprobs.git")
+library(variantprobs)
+library(rvest)
+library(reshape)
+library(boot)
+library(knitr)
+library(kableExtra)
+library(parallel)
+library(e1071)
+library(drc)
+library(plotly)
+library(spatstat.utils)
+library(DescTools)
+library(GGally)
+library(parallel)
+library(lattice)
+
+data(tcga)
+
+tcga_genelist<-tcga[MS == "Non-hypermutated" & !is.na(Cancer_Code),]$Hugo_Symbol %>% unique()
+```
+
+## Build Cluster Space
+```{r Build Cluster Space}
+
+#read in covariates and remove empty rows
+epigenetic_data<-read.csv("covariate-table.csv", header=TRUE)
+epigenetic_data<-epigenetic_data[epigenetic_data$gene!="",]
+epigenetic_data<-epigenetic_data[epigenetic_data$gene %in% tcga_genelist,]
+
+#create space of epigenetic predictors, Z scale predictors, only complete cases
+cluster_space<-cbind(epigenetic_data$expression_CCLE, epigenetic_data$replication_time, epigenetic_data$noncoding_mutation_rate, epigenetic_data$local_GC_content, epigenetic_data$HiC_compartment)
+rownames(cluster_space)<-epigenetic_data$gene
+cluster_space<-cluster_space[complete.cases(cluster_space),]
+cluster_space<-scale(cluster_space)
+cluster_space<-as.data.frame(cluster_space)
+colnames(cluster_space)<-c("expression", "rep_time", "nc_mut_rate", "loc_GC_cont", "HiC")
+#only include clusters in tcga
+cluster_space<-cluster_space[rownames(cluster_space) %in% tcga_genelist, ]
+```
+
+## Get exome lengths and edit cluster space to contain only genes with exonic size information
+```{r}
+exome_sizes<-data.table::fread("gencode.v19.basic.exome.bed")
+###replace X 
+exome_sizes$V1<-as.numeric(exome_sizes$V1)
+exome_sizes$V1[is.na(exome_sizes$V1)]<-23
+
+exome_sizes$V2<-as.numeric(exome_sizes$V2)
+exome_sizes$V3<-as.numeric(exome_sizes$V3)
+exome_sizes<-exome_sizes[complete.cases(exome_sizes),]
+colnames(exome_sizes)<-c("chrom", "chromStart", "chromEnd")
+
+genelengths<-data.frame(chrom=epigenetic_data$chr[epigenetic_data$gene %in% tcga_genelist], chromStart=epigenetic_data$start[epigenetic_data$gene %in% tcga_genelist], chromEnd=epigenetic_data$end[epigenetic_data$gene %in% tcga_genelist])
+
+setDT(exome_sizes)
+setDT(genelengths)
+setkey(genelengths)
+#if any exon overlaps with gene coordinates, then join them
+annotated_exons<-foverlaps(exome_sizes, genelengths, type="any", nomatch=0L)
+
+genelengths<-data.frame(chrom=epigenetic_data$chr[epigenetic_data$gene %in% tcga_genelist], chromStart=epigenetic_data$start[epigenetic_data$gene %in% tcga_genelist], chromEnd=epigenetic_data$end[epigenetic_data$gene %in% tcga_genelist], gene=epigenetic_data$gene[epigenetic_data$gene %in% tcga_genelist])
+
+#full join exon coordinates and gene names
+exon_annotations<-full_join(annotated_exons, genelengths, by=c("chromStart")) %>% select(i.chromStart, i.chromEnd, gene)
+
+#genes listed by their exon sizes
+exon_sizes<- exon_annotations %>% mutate(length=i.chromEnd-i.chromStart) %>% group_by(gene) %>% summarize(size=sum(length)) %>% as.data.frame()
+
+#edit exon_sizes to only include genes in cluster_space
+exon_sizes<-exon_sizes[exon_sizes$gene %in% rownames(cluster_space),]
+```
+
+## Functions to loop
+```{r Functions to Loop}
+
+#######
+#calculate probability matrix
+#######
+
+prob_mat_calc<-function(cluster_assignments){
+  
+  clusters<-data.frame(gene=rownames(cluster_space), assignments=cluster_assignments)
+  
+  cluster_sizes<-setNames(data.frame(cluster= cluster_assignments, lengths=exon_sizes$size[match(rownames(cluster_space), exon_sizes$gene)]), c("cluster", "lengths")) %>% group_by(cluster) %>% summarize(length=sum(lengths))
+  
+  tcga_clust<-left_join(clusters, tcga[MS == "Non-hypermutated" & !is.na(Cancer_Code),], by=c("gene"="Hugo_Symbol"))
+  colnames(tcga_clust)<-c("gene", "Cluster", "patient_id", "Variant", "Cancer_Code", "MS")
+  setDT(tcga_clust)
+  
+#filter by nonhypermutated mutation signature and non-NA Cancer Code
+tcga_v_f <- tcga_clust[
+  # filter out all hypermutated tumors
+  # & tumors with unknown cancer
+  MS == "Non-hypermutated" & !is.na(Cancer_Code),
+  ][
+    ,
+    # number of tumors per cancer type
+    n_tumor := length(unique(patient_id)),
+    by = Cancer_Code
+    ][,
+      # variant frequencies by CLUSTER, cancer type
+      # also save n_tumor per cancer
+      .(v_f = length(unique(patient_id)),
+        n_tumor = n_tumor[1]),
+      by = .(Variant, Cluster, Cancer_Code)
+      ]
+
+tcga_newprob_given_cancer <- tcga_v_f[,
+    # Calculate Good Turing probabilities of
+    # at least one new variants per CLUSTER & cancer type
+    {
+      GT_probs <- goodturing_probs(
+        counts = v_f,
+        m = n_tumor[1]
+      )
+      .(p_atleast_1new_perMB = GT_probs['atleast_1new'])
+    },
+    by = .(Cluster, Cancer_Code)
+    ] %>%
+  # cast the long data frame into wide format -- fill missing values
+  # (i.e. no mutation for that (CLUSTER, cancer) pair)
+  # with ZERO
+  # replace fill = 0 by
+  # fill = 1 - exp(- 1/(length(unique(tcga$patient_id)) + 1))
+  # to exactly recreate Fig 3b in Nat. Comm. paper
+  dcast(
+    Cluster ~ Cancer_Code,
+    value.var = "p_atleast_1new_perMB",
+    fill = 0
+  ) %>%
+  # put  Clusters as row names
+  # and convert the data table into a matrix
+  magrittr::set_rownames(.$Cluster) %>%
+  .[, Cluster := NULL] %>%
+  data.matrix()
+
+#cancer probs are agnostic to metagene size... correct for metagene size
+tcga_newprob_given_cancer_per10kb<-tcga_newprob_given_cancer *1E4/cluster_sizes$length
+return(tcga_newprob_given_cancer_per10kb)
+}
+
+#####
+#Calc NMI 
+#####
+
+calc_NMI<-function(tcga_newprob_given_cancer_per10kb){
+# Find the relative frequencies of cancer sites
+cancer_npatient <- tcga[
+  !is.na(Cancer_Code) & MS == "Non-hypermutated",
+  .(cancer_npatient = length(unique(patient_id))),
+  by = Cancer_Code
+  ][,
+    cancer_rf := cancer_npatient/sum(cancer_npatient)
+    ]
+
+cancer_prob <- cancer_npatient$cancer_rf %>%
+  setNames(cancer_npatient$Cancer_Code)
+
+# calc_minfo has two main arguments:
+# (a) prob_mat: matrix (( p_gc )), where
+# p_ij = P(Event associated with gene - g | Cancer - c)
+# and (b) cancer_prob: vector ( p_c ) where p_c = P(Cancer - c).
+# names(cancer_prob) and colnames(prob_mat) should be identical
+# The function will return a vector
+# of length nrow(prob_mat), for all genes in prob_mat
+
+nmi <- calc_minfo(
+  tcga_newprob_given_cancer_per10kb,
+  cancer_prob,
+  binary_minfo = FALSE,
+  normalize = TRUE
+)
+
+# see the top 20
+return(nmi)
+}
+
+########
+#HIGHEST LEVEL FUNCTION
+########
+
+#argument is vector of cluster assignments
+
+calc_NMI<-function(cluster_assignments, standardize=TRUE){
+  
+  clusters<-data.frame(gene=rownames(cluster_space), assignments=cluster_assignments)
+  
+  cluster_sizes<-setNames(data.frame(cluster= cluster_assignments, lengths=exon_sizes$size[match(rownames(cluster_space), exon_sizes$gene)]), c("cluster", "lengths")) %>% group_by(cluster) %>% summarize(length=sum(lengths))
+  
+  tcga_clust<-left_join(clusters, tcga[MS == "Non-hypermutated" & !is.na(Cancer_Code),], by=c("gene"="Hugo_Symbol"))
+  colnames(tcga_clust)<-c("gene", "Cluster", "patient_id", "Variant", "Cancer_Code", "MS")
+  setDT(tcga_clust)
+  
+#filter by nonhypermutated mutation signature and non-NA Cancer Code
+tcga_v_f <- tcga_clust[MS == "Non-hypermutated" & !is.na(Cancer_Code)][
+    ,
+    # number of tumors per cancer type
+    n_tumor := length(unique(patient_id)),
+    by = Cancer_Code
+    ][,
+      # variant frequencies by CLUSTER, cancer type
+      # also save n_tumor per cancer
+      .(v_f = length(unique(patient_id)),
+        n_tumor = n_tumor[1]),
+      by = .(Variant, Cluster, Cancer_Code)
+      ]
+
+tcga_newprob_given_cancer <- suppressWarnings(tcga_v_f[,
+    # Calculate Good Turing probabilities of
+    # at least one new variants per CLUSTER & cancer type
+    {
+      GT_probs <- goodturing_probs(
+        counts = v_f,
+        m = n_tumor[1]
+      )
+      .(p_atleast_1new_per10kb = GT_probs['atleast_1new'])
+    },
+    by = .(Cluster, Cancer_Code)
+    ] %>%
+  # cast the long data frame into wide format -- fill missing values
+  # (i.e. no mutation for that (CLUSTER, cancer) pair)
+  # with ZERO
+  # replace fill = 0 by
+  # fill = 1 - exp(- 1/(length(unique(tcga$patient_id)) + 1))
+  # to exactly recreate Fig 3b in Nat. Comm. paper
+  dcast(
+    Cluster ~ Cancer_Code,
+    value.var = "p_atleast_1new_per10kb",
+    fill = 1 - exp(- 1/(length(unique(tcga$patient_id)) + 1))
+  ) %>%
+  # put  Clusters as row names
+  # and convert the data table into a matrix
+  magrittr::set_rownames(.$Cluster) %>%
+  .[, Cluster := NULL] %>%
+  data.matrix())
+
+#cancer probs are agnostic to metagene size... correct for metagene size
+tcga_newprob_given_cancer_per10kb<-ifelse(standardize==TRUE, tcga_newprob_given_cancer *1E4/cluster_sizes$length, tcga_newprob_given_cancer)
+
+cancer_npatient <- tcga[
+  !is.na(Cancer_Code) & MS == "Non-hypermutated",
+  .(cancer_npatient = length(unique(patient_id))),
+  by = Cancer_Code
+  ][,
+    cancer_rf := cancer_npatient/sum(cancer_npatient)
+    ]
+
+cancer_prob <- cancer_npatient$cancer_rf %>%
+  setNames(cancer_npatient$Cancer_Code)
+
+# calc_minfo has two main arguments:
+# (a) prob_mat: matrix (( p_gc )), where
+# p_ij = P(Event associated with gene - g | Cancer - c)
+# and (b) cancer_prob: vector ( p_c ) where p_c = P(Cancer - c).
+# names(cancer_prob) and colnames(prob_mat) should be identical
+# The function will return a vector
+# of length nrow(prob_mat), for all genes in prob_mat
+
+nmi <- calc_minfo(
+  tcga_newprob_given_cancer_per10kb,
+  cancer_prob,
+  binary_minfo = FALSE,
+  normalize = TRUE
+)
+
+# see the top 20
+return(nmi)
+}
+
+```
+
+## Adjusting the clustering procedure
+```{r}
+######
+#50 clusters
+
+cluster_membership<-data.frame(matrix(nrow=dim(cluster_space)[1], ncol=10))
+
+cluster_membership<-mclapply(X=1:10, FUN= function(X) kmeans(cluster_space, 50, nstart = 1, iter.max=20)$cluster, mc.cores=7)
+
+#read list into dataframe by column, producing a dataframe of 500 columns and 16000 rows
+df50 <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+
+rownames(df50)<-rownames(cluster_space)
+
+dt50<-as.data.table(df50)
+nmi_50<-dt50[ , lapply(.SD, "calc_NMI"), .SDcols = 1:10]
+
+######
+#250 clusters
+
+cluster_membership<-data.frame(matrix(nrow=dim(cluster_space)[1], ncol=10))
+
+cluster_membership<-mclapply(X=1:10, FUN= function(X) kmeans(cluster_space, 250, nstart = 1, iter.max=20)$cluster, mc.cores=7)
+
+#read list into dataframe by column, producing a dataframe of 500 columns and 16000 rows
+df250 <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+
+rownames(df250)<-rownames(cluster_space)
+
+dt250<-as.data.table(df250)
+nmi_250<-dt250[ , lapply(.SD, "calc_NMI"), .SDcols = 1:10]
+
+#######
+#1000 clusters
+
+cluster_membership<-data.frame(matrix(nrow=dim(cluster_space)[1], ncol=5))
+
+cluster_membership<-mclapply(X=1:5, FUN= function(X) kmeans(cluster_space, 1000, nstart = 1, iter.max=20)$cluster, mc.cores=7)
+
+#read list into dataframe by column, producing a dataframe of 500 columns and 16000 rows
+df1000 <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+
+rownames(df1000)<-rownames(cluster_space)
+
+dt1000<-as.data.table(df1000)
+nmi_1000<-dt1000[ , lapply(.SD, "calc_NMI"), .SDcols = 1:5]
+
+#######
+#2500 clusters
+
+cluster_membership<-data.frame(matrix(nrow=dim(cluster_space)[1], ncol=3))
+
+cluster_membership<-mclapply(X=1:3, FUN= function(X) kmeans(cluster_space, 2500, nstart = 1, iter.max=20)$cluster, mc.cores=6)
+
+#read list into dataframe by column, producing a dataframe of 500 columns and 16000 rows
+df2500 <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+
+rownames(df2500)<-rownames(cluster_space)
+
+dt2500<-as.data.table(df2500)
+nmi_2500<-dt2500[ , lapply(.SD, "calc_NMI"), .SDcols = 1:3]
+
+#######
+#3750 clusters
+
+cluster_membership<-data.frame(matrix(nrow=dim(cluster_space)[1], ncol=2))
+
+cluster_membership<-mclapply(X=1:2, FUN= function(X) kmeans(cluster_space, 3750, nstart = 1, iter.max=20)$cluster, mc.cores=6)
+
+#read list into dataframe by column, producing a dataframe of 500 columns and 16000 rows
+df3750 <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+
+rownames(df3750)<-rownames(cluster_space)
+
+dt3750<-as.data.table(df3750)
+nmi_3750<-dt3750[ , lapply(.SD, "calc_NMI"), .SDcols = 1:2]
+
+########
+#5000 clusters
+
+cluster_membership<-data.frame(matrix(nrow=dim(cluster_space)[1], ncol=2))
+
+cluster_membership<-mclapply(X=1:2, FUN= function(X) kmeans(cluster_space, 5000, nstart = 1, iter.max=20)$cluster, mc.cores=7)
+
+#read list into dataframe by column, producing a dataframe of 500 columns and 16000 rows
+df5000 <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+
+rownames(df5000)<-rownames(cluster_space)
+
+dt5000<-as.data.table(df5000)
+nmi_5000<-dt5000[ , lapply(.SD, "calc_NMI"), .SDcols = 1:2]
+```
+
+## Run on IMPACT genes as reference
+
+```{r IMPACT Reference}
+data(impact)
+setDT(impact)
+
+#list of impact genes
+impact_genelist <- impact[MS=="Non-hypermutated" & !is.na(Cancer_Type)] %>% select(Hugo_Symbol) %>% unique() %>% unlist() %>% unname()
+
+####calculate exome sizes for these genes
+
+exome_sizes<-data.table::fread("gencode.v19.basic.exome.bed")
+###replace X chromosome with 23
+exome_sizes$V1<-as.numeric(exome_sizes$V1)
+exome_sizes$V1[is.na(exome_sizes$V1)]<-23
+
+exome_sizes$V2<-as.numeric(exome_sizes$V2)
+exome_sizes$V3<-as.numeric(exome_sizes$V3)
+exome_sizes<-exome_sizes[complete.cases(exome_sizes),]
+colnames(exome_sizes)<-c("chrom", "chromStart", "chromEnd")
+
+genelengths<-data.frame(chrom=epigenetic_data$chr[epigenetic_data$gene %in% impact_genelist], chromStart=epigenetic_data$start[epigenetic_data$gene %in% impact_genelist], chromEnd=epigenetic_data$end[epigenetic_data$gene %in% impact_genelist])
+
+setDT(exome_sizes)
+setDT(genelengths)
+setkey(genelengths)
+#if any exon overlaps with gene coordinates, then join them
+annotated_exons<-foverlaps(exome_sizes, genelengths, type="any", nomatch=0L)
+annotated_exons
+
+genelengths<-data.frame(chrom=epigenetic_data$chr[epigenetic_data$gene %in% impact_genelist], chromStart=epigenetic_data$start[epigenetic_data$gene %in% impact_genelist], chromEnd=epigenetic_data$end[epigenetic_data$gene %in% impact_genelist], gene=epigenetic_data$gene[epigenetic_data$gene %in% impact_genelist])
+
+#full join exon coordinates and gene names
+exon_annotations<-full_join(annotated_exons, genelengths, by=c("chromStart")) %>% select(i.chromStart, i.chromEnd, gene)
+
+#genes listed by their exon sizes
+exon_sizes<- exon_annotations %>% mutate(length=i.chromEnd-i.chromStart) %>% group_by(gene) %>% summarize(size=sum(length)) %>% as.data.frame()
+
+#genes in impact that we don't have metafeature annotations for... only return those genes with annotations
+impact_genelist<-setdiff(impact_genelist, setdiff(impact_genelist, exon_sizes$gene))
+
+
+#######Calculate variant probs
+
+# TCGA variant frequencies & n_tumors by cancer sites
+tcga_v_f <- tcga[
+  # filter out all hypermutated tumors
+  # & tumors with unknown cancer
+  MS == "Non-hypermutated" & !is.na(Cancer_Code),
+  ][
+    ,
+    # number of tumors per cancer type
+    n_tumor := length(unique(patient_id)),
+    by = Cancer_Code
+    ][,
+      # variant frequencies by gene, cancer type
+      # also save n_tumor per cancer
+      .(v_f = length(unique(patient_id)),
+        n_tumor = n_tumor[1]),
+      by = .(Variant, Hugo_Symbol, Cancer_Code)
+      ]
+
+
+# matrix of P(at least 1 new variant in Gene - g | Cancer k)
+# for all genes with rel freq >= 0.01
+tcga_newprob_given_cancer <- tcga_v_f[
+  # keep only top_genes
+  Hugo_Symbol %in% impact_genelist,
+  ][,
+    # Calculate Good Turing probabilities of
+    # at least one new variants per gene & cancer type
+    {
+      GT_probs <- goodturing_probs(
+        counts = v_f,
+        m = n_tumor[1]
+      )
+      .(p_atleast_1new_v = GT_probs['atleast_1new'])
+    },
+    by = .(Hugo_Symbol, Cancer_Code)
+    ] %>%
+  # cast the long data frame into wide format -- fill missing values
+  # (i.e. no mutation for that (gene, cancer) pair)
+  # with ZERO
+  # replace fill = 0 by
+  # fill = 1 - exp(- 1/(length(unique(tcga$patient_id)) + 1))
+  # to exactly recreate Fig 3b in Nat. Comm. paper
+  dcast(
+    Hugo_Symbol ~ Cancer_Code,
+    value.var = "p_atleast_1new_v",
+    fill = 1 - exp(- 1/(length(unique(tcga$patient_id)) + 1))
+  ) %>%
+  # put  Hugo_Symbols as row names
+  # and convert the data table into a matrix
+  magrittr::set_rownames(.$Hugo_Symbol) %>%
+  .[, Hugo_Symbol := NULL] %>%
+  data.matrix()
+
+
+###### Adjust probability by exon size and scale to probability per 10-kb
+
+tcga_newprob_given_cancerper10kb=(tcga_newprob_given_cancer * 1e4/exon_sizes$size[match(rownames(tcga_newprob_given_cancer), exon_sizes$gene)])
+
+
+# Find the relative frequencies of cancer sites
+cancer_npatient <- tcga[
+  !is.na(Cancer_Code) & MS == "Non-hypermutated",
+  .(cancer_npatient = length(unique(patient_id))),
+  by = Cancer_Code
+  ][,
+    cancer_rf := cancer_npatient/sum(cancer_npatient)
+    ]
+
+
+cancer_prob <- cancer_npatient$cancer_rf %>%
+  setNames(cancer_npatient$Cancer_Code)
+
+# calc_minfo has two main arguments:
+# (a) prob_mat: matrix (( p_gc )), where
+# p_ij = P(Event associated with gene - g | Cancer - c)
+# and (b) cancer_prob: vector ( p_c ) where p_c = P(Cancer - c).
+# names(cancer_prob) and colnames(prob_mat) should be identical
+# The function will return a vector
+# of length nrow(prob_mat), for all genes in prob_mat
+nmi_IMPACT <- calc_minfo(
+  tcga_newprob_given_cancerper10kb,
+  cancer_prob,
+  binary_minfo = FALSE,
+  normalize = TRUE
+)
+
+nmi_IMPACT_melt<-nmi_IMPACT %>% melt()
+nmi_IMPACT_melt %>% max()
+```
+
+## Plot boxplots of response
+
+```{r}
+nmi_50_melt<-melt(nmi_50 %>% as.data.frame())
+nmi_50_melt$variable<-NULL
+nmi_50_melt$k<-"k=50"
+
+nmi_250_melt<-melt(nmi_250 %>% as.data.frame())
+nmi_250_melt$variable<-NULL
+nmi_250_melt$k<-"k=250"
+
+nmi_1000_melt<-melt(nmi_1000 %>% as.data.frame())
+nmi_1000_melt$variable<-NULL
+nmi_1000_melt$k<-"k=1000"
+
+nmi_2500_melt<-melt(nmi_2500 %>% as.data.frame())
+nmi_2500_melt$variable<-NULL
+nmi_2500_melt$k<-"k=2500"
+
+nmi_3750_melt<-melt(nmi_3750 %>% as.data.frame())
+nmi_3750_melt$variable<-NULL
+nmi_3750_melt$k<-"k=3750"
+
+nmi_5000_melt<-melt(nmi_5000 %>% as.data.frame())
+nmi_5000_melt$variable<-NULL
+nmi_5000_melt$k<-"k=5000"
+
+nmi_clust<-rbind(nmi_IMPACT, nmi_50_melt, nmi_3750_melt, nmi_250_melt, nmi_1000_melt, nmi_2500_melt, nmi_5000_melt)
+nmi_clust$k<-factor(nmi_clust$k, levels=c("IMPACT no pooling", "k=50", "k=250", "k=1000", "k=2500", "k=3750", "k=5000"))
+
+nmi_clust %>% ggplot()+geom_boxplot(aes(x=k, y=value, fill=k))+ylab("NMI (per 10 kb)")+xlab("Init. Number Clusters k")+theme_bw()+labs(fill = "Number of Initial Clusters k", size=10)+theme(legend.key.size = unit(1.5, "cm"))
+```
+
+## Deep search into k=250 clusters
+```{r}
+### Do we find more NMI's the deeper we dive?
+
+#dive=10
+cluster_membership<-data.frame(matrix(nrow=dim(cluster_space)[1], ncol=10))
+
+cluster_membership<-mclapply(X=1:10, FUN= function(X) kmeans(cluster_space, 250, nstart = 1, iter.max=20)$cluster, mc.cores=7)
+
+#read list into dataframe by column, producing a dataframe of 500 columns and 16000 rows
+df250_10 <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+
+rownames(df250_10)<-rownames(cluster_space)
+
+dt250_10<-as.data.table(df250_10)
+nmi_250_10<-dt250_10[ , lapply(.SD, "calc_NMI"), .SDcols = 1:10]
+
+
+#dive=50
+cluster_membership<-data.frame(matrix(nrow=dim(cluster_space)[1], ncol=50))
+
+cluster_membership<-mclapply(X=1:50, FUN= function(X) kmeans(cluster_space, 250, nstart = 1, iter.max=20)$cluster, mc.cores=7)
+
+#read list into dataframe by column, producing a dataframe of 500 columns and 16000 rows
+df250_50 <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+
+rownames(df250)<-rownames(cluster_space)
+
+dt250_50<-as.data.table(df250_50)
+nmi_250_50<-dt250_50[ , lapply(.SD, "calc_NMI"), .SDcols = 1:50]
+
+######boxplot
+nmi_250_10_melt<-melt(nmi_250_10 %>% as.data.frame())
+nmi_250_10_melt$variable<-NULL
+nmi_250_10_melt$depth<-"Depth=10"
+
+nmi_250_50_melt<-melt(nmi_250_50 %>% as.data.frame())
+nmi_250_50_melt$variable<-NULL
+nmi_250_50_melt$depth<-"Depth=50"
+
+nmi_250_together<-rbind(nmi_250_10_melt, nmi_250_50_melt)
+
+ggplot(nmi_250_together)+geom_boxplot(aes(x=depth, y=value, fill=depth))+ylab("NMI (per 10 kb)")+xlab("Number of Iterations")+theme_bw()+labs(fill = "Number of Initial Clusters k", size=10)+theme(legend.key.size = unit(1.5, "cm"))
+```
+
+
+## Look at identity of clusters with high NMI
+
+```{r}
+indices=which(nmi_2500>0.02, arr.ind=TRUE)
+
+metagene_list<-vector("list", length = dim(indices)[1])
+
+for (i in 1:dim(indices)[1]){
+  metagene_list[[i]]<-rownames(df2500[df2500[,indices[i,2]]==indices[i,1], ])
+}
+
+metagene_list
+
+
+###Functions
+
+goodTuring_meta<-function(genes){
+#obtain variant frequencies
+tcga_v_f <- tcga[
+  # filter out all hypermutated tumors
+  # & tumors with unknown cancer
+  MS == "Non-hypermutated" & !is.na(Cancer_Code) & Hugo_Symbol %in% genes,
+  ][
+    ,
+    # number of tumors per cancer type
+    n_tumor := length(unique(patient_id)),
+    by = Cancer_Code
+    ][,
+      # variant frequencies by gene, cancer type
+      # also save n_tumor per cancer
+      .(v_f = length(unique(patient_id)),
+        n_tumor = n_tumor[1]),
+      by = .(Variant, Hugo_Symbol, Cancer_Code)
+      ]
+
+tcga_newprob_given_cancer <-tcga_v_f[
+  # keep only top_genes
+  Hugo_Symbol %in% genes,
+  ][,
+    # Calculate Good Turing probabilities of
+    # at least one new variants per gene & cancer type
+    {
+      GT_probs <- goodturing_probs(
+        counts = v_f,
+        m = n_tumor[1]
+      )
+      .(p_atleast_1new_v = GT_probs['atleast_1new'])
+    },
+    by = .(Cancer_Code)
+    ]
+
+return(tcga_newprob_given_cancer)
+}
+
+goodTuring_meta(metagene_list[[16]])
+```
+

@@ -1,0 +1,416 @@
+---
+title: "6_22_2020_2prongapproach"
+author: "Ethan Ashby"
+date: "6/19/2020"
+output:
+  html_document: default
+  word_document: default
+---
+
+# Overview 
+
+Last time, we saw that genes with high coefficients of variance tended to be hotspot genes, i.e. genes that accumulated large numbers of the same variants because these variants conferred a competitive advantage to the tumor celll. Thus, these genes tended to have more high-Nr mutations, relatively low numbers of singletons, and therefore higher coefficients of variation. 
+
+The goal this time around was to see if these genes with high coefficients of variance reflect any similar patterns or display heterogeneity in the reasons why their cofficients of variance were so high. 
+
+As we relaxed the mutation threshold cutoff, we saw more and more genes get included, and the threshold for the problematic region increase, although we were concerned that large values would tend to overwhelm when looking at the plot.
+
+We figured we needed an easier to interpret metric, so MSK-IMPACT probabilities were collected to assess the accuracy of Good-Turing predictions.
+
+Lastly, we were interested in whether metafeatures could be used to predict coefficient of variation.
+
+
+```{r chunk options packages functions, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	fig.height = 5,
+	fig.width = 7,
+	message = FALSE,
+	warning = FALSE,
+	comment = NA,
+	results = "hide",
+	cache = TRUE,
+	fig.keep="none"
+)
+
+library(dplyr)
+library(magrittr)
+library(knitr)
+library(devtools)
+library(magrittr)
+library(tidyverse)
+library(data.table)
+#options(buildtools.check = function(action) TRUE )
+#install_github("https://github.com/c7rishi/variantprobs.git")
+library(variantprobs)
+library(rvest)
+library(reshape)
+library(boot)
+library(knitr)
+library(kableExtra)
+library(parallel)
+library(e1071)
+library(drc)
+library(plotly)
+library(spatstat.utils)
+library(DescTools)
+library(GGally)
+
+data(tcga)
+
+#filter only non-hypermutated genes
+tcga_nh <- data.table::setDT(tcga) %>% filter(MS=="Non-hypermutated")
+
+goodTuring_SE<-function(gene){
+#obtain variant frequencies
+var_freq <- tcga_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+v_f <- var_freq$v_f
+names(v_f) <- var_freq$Variant
+num_samps <- length(unique(tcga_nh$patient_id))
+
+#run goodturing
+GToutput<-goodturing_probs(counts=v_f, m=num_samps)
+
+#output in list
+output<-list("good_turing"=c(GToutput), "chao"=attributes(GToutput)$N0, "good_turing_se"=attributes(GToutput)$se, "reliable_beta"=attributes(GToutput)$smooth_slope_ok)
+
+output
+}
+
+#return N at threshold level
+N_return<-function(gene, thresh=1){
+  #obtain variant frequencies
+  var_freq <- tcga_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+  N=sum(v_f %in% seq(1,thresh,1))
+  N
+}
+
+#return vector of Nr's
+Nr_return<-function(gene){
+  #obtain variant frequencies
+  var_freq <- tcga_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+  v_f %>% table() %>% c()
+}
+
+freq_singleton<-function(Nr){
+  Nr[1]/(names(Nr) %>% as.numeric() * Nr) %>% sum()
+}
+```
+
+# Delving into small cohort
+
+In the small cohort of genes (mutation thresh>0.03), barplots and density plots of the coefficients of variance show a slight right skewed distribution, with 6 genes showing higher variance. What is driving these higher variances?
+
+```{r Small Cohort Exploration, fig.keep="all"}
+#####
+#Filter genes w/ frequency>0.03
+#####
+
+#sample size
+num_samps<-length(unique(tcga_nh$patient_id))
+
+#filter variants where mutation rate (num_variants/num_samples)>0.03
+#GOI is a vector containing genes of interest to label on the N_1 vs coef of var/norm estimates plot
+varselect_CV_norm_plots<-function(muta_rate_thresh, GOI, interactive=TRUE, cutoff){
+
+#output vector
+output<-c()
+  
+#filter by mutation rate threshold
+filtered_variants<-tcga_nh %>% dplyr::group_by(Hugo_Symbol) %>% dplyr::filter(dplyr::n()/num_samps>muta_rate_thresh)
+
+#now define your gene list as these filtered genes
+genelist<-filtered_variants$Hugo_Symbol %>% unique()
+
+#print number of filtered genes
+print(paste(length(genelist), "genes passed filter criteria", sep=" "))
+
+#apply over list
+variant_stats<-c(lapply(genelist, goodTuring_SE))
+names(variant_stats)<-genelist
+
+#how many genes show reliable betas? print result
+counter=0
+for (i in 1:length(variant_stats)){
+  if(variant_stats[[i]]$reliable_beta==TRUE){counter=counter+1}
+}
+output<-c(output, counter)
+print(paste(output, "genes produced reliable beta estimates", sep=" "))
+
+#Coefficient of Variation (SE/Estimate) stored in vector
+CVvec<-c()
+for (i in 1:length(variant_stats)){
+  CVvec<-c(CVvec, (variant_stats[[i]]$good_turing_se %>% tail(1))/(variant_stats[[i]]$good_turing %>% tail(1)))
+}
+names(CVvec)<-genelist
+
+#Normalized Estimates stored in vector
+normvec<-c()
+for (i in 1:length(variant_stats)){
+  normvec<-c(normvec, (variant_stats[[i]]$good_turing %>% tail(1))/(variant_stats[[i]]$good_turing_se %>% tail(1)))
+}
+names(normvec)<-genelist
+
+#######
+#barplots of Coefficient of Variation and Normalized Good-Turing Estimates
+######
+barplot(height=sort(CVvec,decreasing=TRUE), ylab="Coefficient of Variation Good-Turing", las=2, cex.names=0.5)
+
+######
+###Density plot of CV and Norm
+######
+
+plot(density(CVvec), xlab="Coef of Var of Good-Turing Estimates", main="")
+legend("topright", inset=0.1, paste("Kurtosis", round(kurtosis(CVvec), 2), "\n", "Skewness", round(skewness(CVvec), 2)), adj = c(0, 0.5), x.intersp = -0.5, y.intersp = 1)
+
+
+######
+###CV and Norm Est vs N1
+######
+
+#extract N_1 for gene cohort
+N_1<-lapply(genelist, N_return, thresh=1)
+N_1<-unlist(N_1)
+
+#CV plot
+
+df=data.frame(cv=CVvec, norm=normvec, n1=N_1, gene=genelist)
+
+if(interactive==TRUE){
+  x=list(title="N1", showgrid = F)
+  y=list(title="Coefficient of Variation")
+  gg<-plot_ly(type="scatter", mode="markers", showlegend=FALSE) %>% add_trace(x=df$n1, y=df$cv, text=paste(df$gene, ": ", "n_1", df$n1, ", CV ", round(df$cv, 2)), hoverinfo="text", marker=list(opacity=0.4)) %>% layout(title="Coef of Variation vs N_1", xaxis = x, yaxis = y)
+  print(gg)
+}
+
+#if GOI is unspecified, then label every 10 genes
+if(interactive==FALSE){
+if(missing(GOI)){
+  df=df[order(df$cv, decreasing=TRUE),]
+
+  plot(df$n1, df$cv, "p", col="red", ylab="Coef of Var of Good-Turing Probs", xlab="N_1")
+  with(df[seq(1,dim(df)[1],10),], text(cv~n1, labels =rownames(df[seq(1,dim(df)[1],10),]), cex=0.8, pos = 4))
+}
+
+#if GOI is specified, label the specified genes
+if(!missing(GOI)){
+  df=df[order(df$cv, decreasing=TRUE),]
+
+  plot(df$n1, df$cv, "p", col="red", ylab="Coef of Var of Good-Turing Probs", xlab="N_1")
+  with(df[rownames(df) %in% GOI,], text(cv~n1, labels =rownames(df[rownames(df) %in% GOI,]), cex=0.8, pos = 4))
+
+                }
+        }
+  return(CVvec[CVvec>cutoff])
+}
+
+varselect_CV_norm_plots(muta_rate_thresh = 0.03, cutoff=0.07, interactive=FALSE, GOI=c("TP53", "EGFR", "PIK3CA", "PTEN", "IDH1", "APC", "MUC5B", "CTNNB1", "KRAS", "BRAF"))
+
+lapply(c("TP53", "EGFR", "PIK3CA", "PTEN", "IDH1", "APC", "MUC5B", "CTNNB1", "KRAS", "BRAF"), Nr_return)
+```
+
+From examining the plotly plots of $N_1$ vs coefficient of variation, $N_1$ precisely predicts the Coefficient of Variation (in the large cohort, N1<100 leads to a coefficient of variation of greater than 0.1). In the small cohort, 10 genes exceed the coefficient of variation cutoff of 0.07: "TP53", "EGFR", "PIK3CA", "PTEN", "IDH1", "APC", "MUC5B", "CTNNB1", "KRAS", & "BRAF". These genes were all characterized by relatively low numbers of singletons, and long-tailed $N_r$ distributions with hotspot mutations. To that end, the Good-Turing estimates and their standard errors were smaller for these 10 genes than those that passed the threshold. However, they did not pass the cutoff because the Good-Turing probabilities (denominator).
+
+```{r, fig.keep="all"}
+filtered_variants<-tcga_nh %>% dplyr::group_by(Hugo_Symbol) %>% dplyr::filter(dplyr::n()/num_samps>0.03)
+
+#now define your gene list as these filtered genes
+genelist<-filtered_variants$Hugo_Symbol %>% unique()
+
+estimates<-lapply(genelist, goodTuring_SE)
+mat<-matrix(nrow=length(genelist), ncol=2)
+for (i in 1:length(estimates)){
+  gt=estimates[[i]]$good_turing %>% tail(1)
+  se=estimates[[i]]$good_turing_se %>% tail(1)
+  mat[i,1]<-gt
+  mat[i,2]<-se
+}
+rownames(mat)<-genelist
+colnames(mat)<-c("GT", "se")
+small_cohort_df<-as.data.frame(mat)
+small_cohort_df$below_thresh<-ifelse(small_cohort_df$se/small_cohort_df$GT<0.07, TRUE, FALSE)
+
+to_plot<-small_cohort_df %>% arrange(GT/se)
+plot(diff(scale(to_plot$se))/diff(scale(to_plot$GT)), type="l", main="Derivative of Coef of Variance in Small Cohort", ylab="dCoefVar/dIndex")
+
+ggplot(small_cohort_df)+theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+geom_point(aes(x=GT, y=se, group=below_thresh, color=below_thresh))+geom_label(aes(x=GT, y=se, label=rownames(small_cohort_df)), nudge_x = 0.02, size=1.5, alpha=1)
+```
+
+
+# MSK-IMPACT Validation
+
+```{r, fig.keep="all"}
+data(impact)
+
+impact_nh<-impact %>% filter(MS=="Non-hypermutated")
+
+impact_validation<-function(gene){
+
+#tcga
+var_freq <- tcga_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+v_f <- var_freq$v_f
+names(v_f)<-var_freq$Variant
+
+#impact
+var_freq_im <- impact_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+v_f_im <- var_freq_im$v_f
+names(v_f_im)<-var_freq_im$Variant
+
+#####
+#Good turing estimate
+#####
+
+h<-goodTuring_SE(gene)
+h$good_turing %>% tail(1)
+
+#####
+#how many tumors have a new variant
+#####
+#count number of new variants (NOT frequency) that appear in the new cohort and divide by total number of tumors
+
+output<-c("GT"= unname(h$good_turing %>% tail(1)), "GT_se"= unname(h$good_turing_se %>% tail(1)), "reliable"=h$reliable_beta, "IMPACT"=length(v_f_im[match(setdiff(names(v_f_im), names(v_f)), names(v_f_im))])/(impact_nh$patient_id %>% unique() %>% length()))
+
+return(output)
+}
+
+impact_genelist<-impact_nh$Hugo_Symbol %>% unique()
+
+#apply function over whole genelist
+validation_results<-mclapply(X=impact_genelist, FUN=impact_validation, mc.cores=4)
+
+#format dataframe
+impact_validation_mat<-validation_results %>% unlist() %>% matrix(ncol=4, byrow=TRUE)
+colnames(impact_validation_mat)<-c("TCGA_GT", "GT_SE", "reliable","IMPACT")
+rownames(impact_validation_mat)<-impact_genelist
+
+impact_validation_df<-as.data.frame(impact_validation_mat)
+capture<-c()
+for (i in 1:length(impact_validation_df$IMPACT)){
+  capture<-c(capture, inside.range(impact_validation_df$IMPACT[i], c(impact_validation_df$TCGA[i]-(2*impact_validation_df$GT_SE[i]), impact_validation_df$TCGA[i]+(2*impact_validation_df$GT_SE[i]))))
+}
+
+impact_validation_df$capture<-capture
+impact_validation_df$reliable<-as.logical(impact_validation_df$reliable)
+
+#recreating plot from Somatic Variant Richness Paper w/ CI 
+
+ggplot(impact_validation_df)+geom_point(aes(x=TCGA_GT, y=IMPACT), alpha=0.7)+geom_errorbarh(aes(y=IMPACT, xmin=TCGA_GT-(2*GT_SE), xmax=TCGA_GT+(2*GT_SE), color=ifelse(capture==TRUE, "red", "blue")), alpha=0.4)+theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+geom_text(x=0.005, y=0.04, label=paste("Lin's CCC:", CCC(impact_validation_df$TCGA_GT, impact_validation_df$IMPACT)$rho.c[1] %>% round(2), sep=" "))+xlim(0,0.04)+ ylim(0,0.04)+coord_fixed()+geom_abline(intercept=0, slope=1, color="red")+scale_color_discrete(name = "Capture", labels = c("Fail to Capture", "Capture"), guide=guide_legend(reverse=TRUE))+xlab("Estimated from TCGA")+ylab("Observed in MSK-IMPACT")+theme(axis.title=element_text(size=16), axis.text=element_text(size=14), legend.title=element_text(size=15), legend.text=element_text(size=13))
+
+#####
+#where and why do some CIs miss?
+#####
+
+#unreliable beta estimates for 3 genes yield estimates that are WAY off
+impact_validation_df[impact_validation_df$reliable==0,]
+
+#64% of our CI's capture proportion observed in MSK impact 
+impact_validation_df %>% summarize("Prop Capture"=sum(capture==TRUE)/length(IMPACT))
+
+#~83% of our CI misses are when the IMPACT probabilities are larger than those estimated from TCGA
+impact_validation_df %>% filter(capture==FALSE) %>% summarize("Prop IMPACT>TCGA"=sum(TCGA_GT<IMPACT)/length(IMPACT))
+
+missed_genes<-impact_validation_df %>% filter(capture==FALSE) %>% rownames()
+
+Nr_misses<-lapply(missed_genes, Nr_return)
+singleton_freqs_misses<-lapply(Nr_misses, freq_singleton)
+singleton_freqs_misses<-unlist(singleton_freqs_misses)
+
+#vast majority of genes in this cohort are genes that are composed of all singletons
+hist(singleton_freqs_misses, breaks=seq(0,1,by=0.01))
+sum(singleton_freqs_misses==1)/length(singleton_freqs_misses)
+
+
+#Look into misses
+misses_df<-impact_validation_df %>% filter(capture==FALSE)
+misses_df$Nr<-Nr_misses
+misses_df$singleton_freq<-singleton_freqs_misses
+
+misses_df %>% ggplot()+geom_point(aes(x=TCGA_GT, y=IMPACT, col=singleton_freq))+theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+ scale_color_gradient(low="blue", high="magenta")+coord_fixed()
+```
+
+`r impact_validation_df %>% summarize("Prop Capture"=sum(capture==TRUE)/length(IMPACT)) %>% unname() %>% round(2)` of genes in the MSK impact cohort had Good-Turing probability confidence intervals that captured the probability of observing a new variant in the MSK-IMPACT sequencing study. Of those intervals that did not capture the MSK-IMPACT values, `r impact_validation_df %>% filter(capture==FALSE) %>% summarize("Prop IMPACT>TCGA"=sum(TCGA_GT<IMPACT)/length(IMPACT)) %>% unname() %>% round(2)` of IMPACT probabilities were greater than those estimated from TCGA. Of these misses `r sum(singleton_freqs_misses==1)/length(singleton_freqs_misses) %>% round(2)` were composed exclusively of singletons.
+
+```{r, fig.keep="all"}
+#what are some possible metrics we could use to assess how well we predict probabilities in MSK-IMPACT
+
+#1) normal probabilities
+
+impact_validation_df %>% summarize("norm probs"=pnorm(IMPACT, mean=TCGA_GT, sd=GT_SE)) %>% unlist() %>% density() %>% plot(main="Normal Probabilities")
+
+#2) IMPACT estimate/TCGA estimate
+
+impact_validation_df %>% summarize("ratio IMPACT/TCGA"=IMPACT/TCGA_GT) %>% unlist() %>% density() %>% plot(main="Ratio IMPACT value/TCGA estimate")
+
+#3) Distance between estimate and value
+
+impact_validation_df %>% summarize("distance between IMPACT and TCGA"=(IMPACT-TCGA_GT)^2) %>% unlist() %>% density() %>% plot(main="Squared Error between IMPACT value and TCGA estimate")
+
+#4) Coefficient of Variation
+
+impact_validation_df %>% summarize("Coef of Variation"=GT_SE/TCGA_GT) %>% unlist() %>% density() %>% plot(main="Coefficient of Variation")
+```
+
+
+# Revisiting the metafeature construction
+
+Do any of these metafeatures carry any signal vis-a-vis Good-Turing probabilities? For genes in the MSK-IMPACT cohort, I generated a scatterplot matrix of the 5 single-variable metafeatures with known correlations to somatic mutation rate: expression, replication time, noncoding mutation rate, local GC content, and HiC compartment. The most significant correlation was between HiC compartment and the Good-Turing probability and SE estimates generated from the TCGA data. Admittedly, all correlations were small and there was no clear trend between any of these metafeatures and the Good-Turing estimates.
+
+
+
+```{r, fig.keep="all", fig.width=8, fig.height=8}
+epigenetic_data<-read.csv("covariate-table.csv", header=TRUE)
+
+#define genelist as genes in MSK-IMPACT
+genelist<-impact_nh$Hugo_Symbol %>% unique()
+
+#pull out columns that are easy to work with: average expression level, DNA replication time, average noncoding mutation freq, GC content, chromosomal compartment
+test_mat<-cbind(epigenetic_data$start, epigenetic_data$end, epigenetic_data$expression_CCLE, epigenetic_data$replication_time, epigenetic_data$noncoding_mutation_rate, epigenetic_data$local_GC_content, epigenetic_data$HiC_compartment)
+#all should be in euclidian coordinates and scaled
+rownames(test_mat)<-epigenetic_data$gene
+colnames(test_mat)<-colnames(epigenetic_data[,c(3:4, 5:9)])
+
+#scale variables
+#test_mat<-scale(test_mat, center=TRUE, scale=TRUE)
+#test_mat<-test_mat[complete.cases(test_mat),]
+
+#filter for genes that appear in our cohort
+#test_mat=test_mat[rownames(test_mat) %in% genelist,]
+
+#######
+#Any signal?
+########
+
+tmp<-cbind(test_mat, impact_validation_df[, c("TCGA_GT", "GT_SE")][match(rownames(test_mat), rownames(impact_validation_df)),])
+tmp<- tmp %>% mutate("length"=end-start)
+tmp<-as.data.frame(tmp)
+colnames(tmp)<-c(colnames(test_mat), "TCGA_GT", "GT_SE")
+tmp<-tmp %>% mutate("Coef of Var"=GT_SE/TCGA_GT)
+tmp$GT_sizecorrected<-log(tmp$TCGA_GT/tmp$length)
+
+ggpairs(tmp[c(3,4,5,6,7,12)])
+
+
+########
+#Are certain metafeature values present in our misses?
+#######
+
+tmp<-cbind(test_mat, misses_df[match(rownames(test_mat), rownames(misses_df)),])
+tmp<-as.data.frame(tmp)
+head(tmp)
+
+#ggpairs(tmp[,1:8])
+```
+
+The metafeature distance neighbors are not producing good-turing estimates close to MSK-IMPACT numbers for several genes.

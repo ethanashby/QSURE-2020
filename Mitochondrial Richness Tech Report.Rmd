@@ -1,0 +1,158 @@
+---
+title: "Somatic Variant Richness in the Mitochondrial Genome"
+author: "Ethan Ashby"
+date: "9/4/2020"
+output: pdf_document
+bibliography: mitoref.bib
+---
+
+```{r setup, include=FALSE}
+#####Mt DNA Probability estimation
+library(tidyverse)
+library(data.table)
+library(variantprobs)
+library(magrittr)
+library(reshape)
+library(reshape2)
+source("calc_minfo.R")
+```
+
+## Introduction
+
+Mitochondria have long thought to be implicated in cancer growth and progression, due to altered energy metabolism in carcinogenic tumors (@Brandon2006; @Zong2016; @Hanahan2011). Additionally, mitochondria are involved in many cellular processes, ranging from biosynthesis to apoptosis, that are intrinsically linked to carcinogenesis. While the circular genome of the mitochondria is small (16.6 kb), it encodes several 13 proteins that form the cellular respiration machinery of the organelle. The mitochondrial genome also encodes several noncoding elements, predominantly transfer RNAs.
+
+High depth, multi-sample molecular characterizations of the mitochondrial genome have illustrated a number of parallels between mtDNA and nDNA (@Yuan2020). Mutational hotspots were observed in the regulatory D loop and the *ND4* gene. *ND5* was most frequently mutated, *ND4* was most frequently mutated in prostate and lung cancers, and *COX1* was most frequently mutated in breast, cervical, and bladder cancers. Yuan et al. identified that truncating mutations were enriched in kidney, colorectal, and thyroid cancers, while copy number variants showed remarkable heterogeneity between cancers. In summary, like the nuclear genome, the mitochondrial genome contains significant mutational heterogeneity in cancer.
+
+In the nuclear genome, there is remarkable heterogeneity in rare variants between genes and across cancer types. Greater than 90% of mutations in The Cancer Genome Atlas (TCGA) are singletons, meaning they appear once across the TCGA sequenced tumors. Previous research used a non-parametric Bayesian methods developed in the fields of ecology and computational linguistics to mine clinically relevant information from rare somatic mutations in major cancer genes (@Chakraborty2019). This study showed that probabilties of encountering previously unseen variants varied dramatically between nuclear genes and primary sites. This project represented an advancement in utility of the preponderance of previouslly neglected, rare mutational information for important clinical tasks like primary site classification.
+
+There has been limited research on the frequencies of rare variation within the mitochondrial genome across several tissue types. Yuan et al. created The Cancer Mitochondria Atlas (TCMA), an open-access web portal to support research and education surrounding mitochondrial cancer genetics. The portal conatins their somatic variant, copy number, and nuclear transfer data available. This research applied the bayesian unseen variant probability estimation method to features in the mitochondrial genome to investigate whether rare mitochondrial variant patterns are tissue specific.
+
+## Methods
+
+I applied the Smoothed Good-Turing frequency estimation functions sourced from the `varprobs` package written by Chakraborty et al.
+
+
+## Results
+
+### Singleton Variants are Abundant in the Mitochondrial Genome
+
+```{r, cache=TRUE, echo=FALSE, fig.cap="Mitochondrial single nucleotide variants are dominated by singleton variants", fig.height=4}
+mtvars<-data.table(read.table("TCMA-MutationSNV.tsv", header=TRUE))
+mtvars$Start<-mtvars$position
+mtvars$Stop<-mtvars$position
+
+mtvars<-setDT(mtvars)
+anno<-data.table(read.csv("mtanno.csv", header=TRUE))
+anno<-setDT(anno[,1:3])
+setkey(anno, Start, Stop)
+annotated_mt<-foverlaps(mtvars, anno, by.y=key(anno), type="any", nomatch=0L)
+
+dt<-annotated_mt %>% dplyr::select(Gene, sample_id, cancer_type, i.Start, ref, var, var_type)
+
+mt_v_f <- dt %>% group_by(cancer_type) %>% mutate(n_tumor=length(unique(sample_id)))
+
+mt_v_f<-mt_v_f %>% group_by(i.Start, ref, var, Gene, cancer_type) %>% mutate(v_f = length(unique(sample_id)), n_tumor = n_tumor[1])
+
+mt_v_f<-mt_v_f %>% ungroup() %>% setDT()
+
+mt_v_f %>% ggplot()+geom_histogram(aes(x=v_f), binwidth=1)+theme_bw()+ylab("Count")+xlab("Variant Frequencies (v_f)")+scale_x_continuous(breaks=seq(1:15))+theme(panel.grid = element_blank())+labs(subtitle= element_text(paste("Singleton frequency: ", round(table(mt_v_f$v_f)[1]/sum(table(mt_v_f$v_f)), 3), "")))
+```
+
+In *Figure 1*, a plot of the frequencies of frequencies indicates that the vast majority of variants (`r round(table(mt_v_f$v_f)[1]/sum(table(mt_v_f$v_f)), 3)` of total SNV) are singletons, meaning that they are observed only once in the 2173 tumor samples. This proportion is quite consistent with the proportion of singleton variants observed in the nuclear genome, as in The Cancer Genome Atlas, >90% of somatic variants were singletons. This finding reinforces the notion that somatic mutations in mitochondria are predominantly rare, and finding ways to extract clinical information from these rare variants is a worthy task.
+
+## Good-Turing Probabilities Show Gene-Specific and Tissue-Specific Patterns in Unseen Variant Probabilities
+
+These singleton variant frequencies were broken down by genomic feature and tissue type, and used to calculate the Smoothed Good-Turing Probability, corresponding to encountering a previously uncatalogued (or new) variant in each gene and tissue type. Bubbleplots of the unseen variant probabilities (*Figure 2*) show variability in these probabilities, suggestive that they may contain gene and tissue-specific signals.
+
+```{r, warning=FALSE, message=FALSE, fig.height=10, echo=FALSE, fig.cap="Unseen variant probabilities show tissue specific patterns in several mitochondrial genomic features."}
+mtga_newprobs_given_cancer<-mt_v_f[,
+       # Calculate Good Turing probabilities of
+       # at least one new variants per gene & cancer type
+       {
+         GT_probs <- goodturing_probs(
+           counts = v_f,
+           m = n_tumor[1]
+         )
+         .(p_atleast_1new_v = GT_probs['atleast_1new'])
+       },
+       by = .(Gene, cancer_type)
+       ] %>%
+  dcast.data.table(
+    Gene ~ cancer_type,
+    value.var = "p_atleast_1new_v",
+    fill = 1 - exp(- 1/(length(unique(mt_v_f$sample_id)) + 1))
+  ) %>%
+  magrittr::set_rownames(.$Gene) %>%
+  .[, Gene := NULL] %>%
+  data.matrix()
+
+mtga_newprobs_given_cancer %>% melt() %>% ggplot()+geom_point(aes(x=Var2, y=Var1, size=value, color=Var1))+theme_bw()+theme(axis.text.x=element_text(angle=90), legend.position="none")+ylab("Genomic Feature")+xlab("Primary Site")
+```
+
+```{r echo=FALSE, cache=TRUE}
+#cancer probs will be the same
+cancer_npatient <- mt_v_f %>% group_by(cancer_type) %>% summarize(cancer_npatient = length(unique(sample_id))) %>% ungroup()
+probs<-cancer_npatient$cancer_npatient/sum(cancer_npatient$cancer_npatient)
+cancer_prob <- probs %>%
+  setNames(cancer_npatient$cancer_type)
+
+perm_nmi<-function(perm_v_f){
+perm_v_f<-mt_v_f %>% mutate(cancer_type=sample(cancer_type, replace=FALSE))
+permprobs<-perm_v_f[,
+       # Calculate Good Turing probabilities of
+       # at least one new variants per gene & cancer type
+       {
+         GT_probs <- goodturing_probs(
+           counts = v_f,
+           m = n_tumor[1]
+         )
+         .(p_atleast_1new_v = GT_probs['atleast_1new'])
+       },
+       by = .(Gene, cancer_type)
+       ] %>%
+  dcast.data.table(
+    Gene ~ cancer_type,
+    value.var = "p_atleast_1new_v",
+    fill = 1 - exp(- 1/(length(unique(perm_v_f$sample_id)) + 1))
+  ) %>%
+  magrittr::set_rownames(.$Gene) %>%
+  .[, Gene := NULL] %>%
+  data.matrix()
+
+nmi <- calc_minfo(
+  permprobs,
+  cancer_prob,
+  binary_minfo = FALSE,
+  normalize = TRUE
+)
+
+data.frame(value=nmi)
+}
+
+null<-suppressWarnings(lapply(1:1000, perm_nmi))
+nulls<-do.call(rbind, null)
+```
+
+```{r echo=FALSE, cache=TRUE}
+cancer_npatient <- mt_v_f %>% group_by(cancer_type) %>% summarize(cancer_npatient = length(unique(sample_id))) %>% ungroup()
+probs<-cancer_npatient$cancer_npatient/sum(cancer_npatient$cancer_npatient)
+cancer_prob <- probs %>%
+  setNames(cancer_npatient$cancer_type)
+
+nmi <- calc_minfo(
+  mtga_newprobs_given_cancer,
+  cancer_prob,
+  binary_minfo = FALSE,
+  normalize = TRUE
+)
+
+to_plot<-rbind(data.frame(value=nmi), nulls)
+to_plot$ref<-c(rep("True NMI", 64), rep("Null", 6400))
+to_plot %>% ggplot(aes(value, color=ref, fill=ref))+geom_density(alpha=0.5)+theme_bw()+theme(panel.grid = element_blank())+geom_vline(xintercept=quantile(nulls$value, 0.95), color="red")
+```
+
+
+
+## Conclusions
+
+## References

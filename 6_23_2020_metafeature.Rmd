@@ -1,0 +1,284 @@
+---
+title: "6_23_2020_metafeature"
+author: "Ethan Ashby"
+date: "6/22/2020"
+output: html_document
+---
+
+```{r}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	fig.height = 5,
+	fig.width = 7,
+	message = FALSE,
+	warning = FALSE,
+	comment = NA,
+	results = "hide",
+	cache = TRUE,
+	fig.keep="all"
+)
+
+library(dplyr)
+library(magrittr)
+library(knitr)
+library(devtools)
+library(magrittr)
+library(tidyverse)
+library(data.table)
+#options(buildtools.check = function(action) TRUE )
+#install_github("https://github.com/c7rishi/variantprobs.git")
+library(variantprobs)
+library(rvest)
+library(reshape)
+library(boot)
+library(knitr)
+library(kableExtra)
+library(parallel)
+library(e1071)
+library(drc)
+library(plotly)
+library(spatstat.utils)
+library(DescTools)
+library(GGally)
+library(parallel)
+
+data(impact)
+
+impact_nh<-impact %>% filter(MS=="Non-hypermutated")
+
+data(tcga)
+
+tcga_nh <- data.table::setDT(tcga) %>% filter(MS=="Non-hypermutated")
+
+###Functions
+
+goodTuring_SE<-function(gene){
+#obtain variant frequencies
+var_freq <- tcga_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+v_f <- var_freq$v_f
+names(v_f) <- var_freq$Variant
+num_samps <- length(unique(tcga_nh$patient_id))
+
+#run goodturing
+GToutput<-goodturing_probs(counts=v_f, m=num_samps)
+
+#output in list
+output<-list("good_turing"=c(GToutput), "chao"=attributes(GToutput)$N0, "good_turing_se"=attributes(GToutput)$se, "reliable_beta"=attributes(GToutput)$smooth_slope_ok)
+
+output
+}
+
+#return N at threshold level
+N_return<-function(gene, thresh=1){
+  #obtain variant frequencies
+  var_freq <- tcga_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+  N=sum(v_f %in% seq(1,thresh,1))
+  N
+}
+
+#return vector of Nr's
+Nr_return<-function(gene){
+  #obtain variant frequencies
+  var_freq <- tcga_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+  v_f <- var_freq$v_f
+  v_f %>% table() %>% c()
+}
+
+freq_singleton<-function(Nr){
+  Nr[1]/(names(Nr) %>% as.numeric() * Nr) %>% sum()
+}
+```
+
+```{r}
+impact_validation<-function(gene){
+
+#tcga
+var_freq <- tcga_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+v_f <- var_freq$v_f
+names(v_f)<-var_freq$Variant
+
+#impact
+var_freq_im <- impact_nh[Hugo_Symbol == gene,
+            .(v_f = length(unique(patient_id))),
+            by = .(Hugo_Symbol, Variant)]
+v_f_im <- var_freq_im$v_f
+names(v_f_im)<-var_freq_im$Variant
+
+#####
+#Good turing estimate
+#####
+
+h<-goodTuring_SE(gene)
+h$good_turing %>% tail(1)
+
+#####
+#how many tumors have a new variant
+#####
+#count number of new variants (NOT frequency) that appear in the new cohort and divide by total number of tumors
+
+output<-c("GT"= unname(h$good_turing %>% tail(1)), "GT_se"= unname(h$good_turing_se %>% tail(1)), "reliable"=h$reliable_beta, "IMPACT"=length(v_f_im[match(setdiff(names(v_f_im), names(v_f)), names(v_f_im))])/(impact_nh$patient_id %>% unique() %>% length()))
+
+return(output)
+}
+
+impact_genelist<-impact_nh$Hugo_Symbol %>% unique()
+
+#apply function over whole genelist
+validation_results<-lapply(X=impact_genelist, FUN=impact_validation)
+
+#format dataframe
+impact_validation_mat<-validation_results %>% unlist() %>% matrix(ncol=4, byrow=TRUE)
+colnames(impact_validation_mat)<-c("TCGA_GT", "GT_SE", "reliable","IMPACT")
+rownames(impact_validation_mat)<-impact_genelist
+
+impact_validation_df<-as.data.frame(impact_validation_mat)
+capture<-c()
+for (i in 1:length(impact_validation_df$IMPACT)){
+  capture<-c(capture, inside.range(impact_validation_df$IMPACT[i], c(impact_validation_df$TCGA[i]-(2*impact_validation_df$GT_SE[i]), impact_validation_df$TCGA[i]+(2*impact_validation_df$GT_SE[i]))))
+}
+
+impact_validation_df$capture<-capture
+impact_validation_df$reliable<-as.logical(impact_validation_df$reliable)
+
+misses_df<-impact_validation_df %>% filter(capture==FALSE)
+```
+
+# Good-Turing metafeature plots standardized by gene size
+
+Trying to group genes by metafeatures. Goal is to generate scatterplot matrix where good-turing probabilities are standardized by gene size.
+
+```{r warning=FALSE}
+library(readxl)
+
+epigenetic_data<-read.csv("covariate-table.csv", header=TRUE)
+
+#define genelist as genes in MSK-IMPACT
+genelist<-impact_nh$Hugo_Symbol %>% unique()
+
+#pull out columns that are easy to work with: average expression level, DNA replication time, average noncoding mutation freq, GC content, chromosomal compartment
+test_mat<-cbind(epigenetic_data$start, epigenetic_data$end, epigenetic_data$expression_CCLE, epigenetic_data$replication_time, epigenetic_data$noncoding_mutation_rate, logit(epigenetic_data$local_GC_content), epigenetic_data$HiC_compartment)
+#all should be in euclidian coordinates and scaled
+rownames(test_mat)<-epigenetic_data$gene
+colnames(test_mat)<-colnames(epigenetic_data[,c(3:4, 5:9)])
+
+#scale variables
+#test_mat<-scale(test_mat, center=TRUE, scale=TRUE)
+#test_mat<-test_mat[complete.cases(test_mat),]
+
+#filter for genes that appear in our cohort
+#test_mat=test_mat[rownames(test_mat) %in% genelist,]
+
+#######
+#Any signal?
+########
+
+tmp<-cbind(test_mat, impact_validation_df[, c("TCGA_GT", "GT_SE")][match(rownames(test_mat), rownames(impact_validation_df)),])
+tmp<-as.data.frame(tmp)
+tmp$length<- tmp$end-tmp$start
+colnames(tmp)<-c(colnames(test_mat), "TCGA_GT", "GT_SE", "length")
+tmp$CoefVar= tmp$GT_SE/tmp$TCGA_GT
+tmp$GT_perMB<-tmp$TCGA_GT/tmp$length *1E6
+
+ggpairs(tmp[c(3,4,5,6,7,12)], progress=FALSE)
+
+#inform response vbl transformations
+fit<-lm(GT_perMB~expression_CCLE+replication_time+noncoding_mutation_rate+local_GC_content+HiC_compartment, data=tmp)
+boxcox(fit) #suggests log transform of response
+
+tmp$GT_perMB<-log(tmp$TCGA_GT/tmp$length *1E6)
+
+my_fn <- function(data, mapping, method="loess", ...){
+      p <- ggplot(data = data, mapping = mapping) + 
+      geom_point() + 
+      geom_smooth(method=method, ...)
+      p
+    }
+
+ggpairs(tmp[c(3,4,5,6,7,12)], progress=FALSE, lower = list(continuous = my_fn))
+#correlations improving
+```
+
+# Refining how we select nearest neighbors using metafeatures
+
+Rather than trying to find associations between metafeatures and Good-Turing probabilities, we can focus on identifying which metafeature groupings correct erroneous Good-Turing probabilities that miss the empirical values in MSK-impact. Even if metafeatures don't show trends with Good-Turing probabilties, if they show local similarity: i.e. genes with similar metafeatures show similar Good-Turing probabilities, that could be leveraged 
+
+
+
+```{r Incorporate background mutation rate}
+test_mat<-cbind(epigenetic_data$start, epigenetic_data$end, epigenetic_data$expression_CCLE, epigenetic_data$replication_time, epigenetic_data$noncoding_mutation_rate, epigenetic_data$local_GC_content, epigenetic_data$HiC_compartment)
+rownames(test_mat)<-epigenetic_data$gene
+colnames(test_mat)<-colnames(epigenetic_data[,c(3:4, 5:9)])
+tmp<-cbind(test_mat, impact_validation_df[, c("TCGA_GT", "GT_SE")][match(rownames(test_mat), rownames(impact_validation_df)),])
+tmp<-tmp[complete.cases(tmp[,8:9]),]
+tmp$length<- tmp$end-tmp$start
+colnames(tmp)<-c(colnames(test_mat), "TCGA_GT", "GT_SE", "length")
+tmp$CoefVar= tmp$GT_SE/tmp$TCGA_GT
+tmp$GT_perMB<-tmp$TCGA_GT/tmp$length *1E6
+
+#scale and center metafeatures
+scaled<-scale(tmp[,c(3,4,5,6,7)], center=TRUE, scale=TRUE)
+scaled %>% head()
+
+
+
+ggplot(tmp)+geom_line(aes(x=expression_CCLE, y=TCGA_GT))+theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+smooth_est<-tmp %>% arrange(expression_CCLE)
+sd(diff(smooth_est$expression_CCLE))/abs(mean(diff(tmp$expression_CCLE)))
+sd(diff(smooth_est$TCGA_GT))/abs(mean(diff(smooth_est$TCGA_GT)))
+
+ggplot(tmp)+geom_line(aes(x=local_GC_content, y=TCGA_GT))+theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+smooth_est<-tmp %>% arrange(local_GC_content)
+sd(diff(smooth_est$local_GC_content))/abs(mean(diff(tmp$local_GC_content)))
+sd(diff(smooth_est$TCGA_GT))/abs(mean(diff(smooth_est$TCGA_GT)))
+
+ggplot(tmp)+geom_line(aes(x=HiC_compartment, y=TCGA_GT))+theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+smooth_est<-tmp %>% arrange(HiC_compartment)
+sd(diff(smooth_est$HiC_compartment))/abs(mean(diff(tmp$HiC_compartment)))
+sd(diff(smooth_est$TCGA_GT))/abs(mean(diff(smooth_est$TCGA_GT)))
+
+ggplot(tmp)+geom_line(aes(x=replication_time, y=TCGA_GT))+theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+smooth_est<-tmp %>% arrange(replication_time)
+sd(diff(smooth_est$replication_time))/abs(mean(diff(tmp$replication_time)))
+sd(diff(smooth_est$TCGA_GT))/abs(mean(diff(smooth_est$TCGA_GT)))
+
+ggplot(tmp)+geom_line(aes(x=noncoding_mutation_rate, y=TCGA_GT))+theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+smooth_est<-tmp %>% arrange(noncoding_mutation_rate)
+sd(diff(smooth_est$noncoding_mutation_rate))/abs(mean(diff(tmp$noncoding_mutation_rate)))
+sd(diff(smooth_est$TCGA_GT))/abs(mean(diff(smooth_est$TCGA_GT)))
+
+#cal neighborhood takes in a function, the normalized noncoding_rate range that you will accept to determine your neighborhood, and the number of nearest neighbors (k) you'd like to extract
+calc_neighborhood<-function(gene, noncoding_rate_margin=0.1, k=3){
+  gene_info<-scaled[rownames(scaled)==gene]
+  neighbors<-scaled[between(scaled[,3], lower=gene_info[3]-noncoding_rate_margin, upper=gene_info[3]+noncoding_rate_margin),]
+  neighbors<-dist(neighbors) %>% as.matrix()
+  nbhd<-neighbors[1,] %>% sort()
+  names(nbhd[2:(k+1)])
+}
+
+
+
+calc_neighborhood(gene="FOXL2", noncoding_rate_margin = 0.1)
+tmp[rownames(tmp) %in% c("FOXL2", calc_neighborhood(gene="FOXL2", noncoding_rate_margin = 0.1)),]
+impact_validation_df[rownames(impact_validation_df)=="FOXL2",]
+
+some_misses<-sample(rownames(misses_df), 10)
+some_misses
+
+res_list<-list()
+for (i in 1:length(some_misses)){
+calc_neighborhood(gene=some_misses[i], noncoding_rate_margin = 0.1)
+res_list[[i]]<-tmp[rownames(tmp) %in% c(some_misses[i], calc_neighborhood(gene=some_misses[i], noncoding_rate_margin = 0.1)),]
+}
+res_list
+```
+
+

@@ -1,0 +1,373 @@
+---
+title: "Week 5 Work Adjust Standardization"
+author: "Ethan Ashby"
+date: "7/1/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+
+```
+
+## Packages
+```{r packages and data}
+library(dplyr)
+library(magrittr)
+library(knitr)
+library(devtools)
+library(magrittr)
+library(tidyverse)
+library(data.table)
+#options(buildtools.check = function(action) TRUE )
+#install_github("https://github.com/c7rishi/variantprobs.git")
+library(variantprobs)
+library(rvest)
+library(reshape)
+library(boot)
+library(e1071)
+library(drc)
+library(DescTools)
+library(lattice)
+library(phyclust)
+library(Rcpp)
+source("calc_minfo.R")
+
+data(tcga)
+tcga_genelist<-tcga[MS == "Non-hypermutated" & !is.na(Cancer_Code),]$Hugo_Symbol %>% unique()
+```
+
+## Cluster Space Build
+
+```{r cluster space}
+epigenetic_data<-read.table("covariate-table.csv", header=TRUE, sep=",")
+colnames(epigenetic_data)[1]<-"gene"
+epigenetic_data<-epigenetic_data[epigenetic_data$gene!="",]
+epigenetic_data<-epigenetic_data[epigenetic_data$gene %in% tcga_genelist,]
+
+#create space of epigenetic predictors, Z scale predictors, only complete cases
+cluster_space<-cbind(epigenetic_data$expression_CCLE, epigenetic_data$replication_time, epigenetic_data$noncoding_mutation_rate, epigenetic_data$local_GC_content, epigenetic_data$HiC_compartment)
+rownames(cluster_space)<-epigenetic_data$gene
+cluster_space<-cluster_space[complete.cases(cluster_space),]
+cluster_space<-scale(cluster_space)
+cluster_space<-as.data.frame(cluster_space)
+colnames(cluster_space)<-c("expression", "rep_time", "nc_mut_rate", "loc_GC_cont", "HiC")
+#only include clusters in tcga
+cluster_space<-cluster_space[rownames(cluster_space) %in% tcga_genelist, ]
+```
+
+## Calculate Exon Sizes
+
+```{r exon sizes}
+
+exome_sizes<-data.table::fread("gencode.v19.basic.exome.bed")
+###replace X 
+exome_sizes$V1<-as.numeric(exome_sizes$V1)
+exome_sizes$V1[is.na(exome_sizes$V1)]<-23
+
+exome_sizes$V2<-as.numeric(exome_sizes$V2)
+exome_sizes$V3<-as.numeric(exome_sizes$V3)
+exome_sizes<-exome_sizes[complete.cases(exome_sizes),]
+colnames(exome_sizes)<-c("chrom", "chromStart", "chromEnd")
+
+genelengths<-data.frame(chrom=epigenetic_data$chr[epigenetic_data$gene %in% tcga_genelist], chromStart=epigenetic_data$start[epigenetic_data$gene %in% tcga_genelist], chromEnd=epigenetic_data$end[epigenetic_data$gene %in% tcga_genelist])
+
+setDT(exome_sizes)
+setDT(genelengths)
+setkey(genelengths)
+#if any exon overlaps with gene coordinates, then join them
+annotated_exons<-foverlaps(exome_sizes, genelengths, type="any", nomatch=0L)
+
+genelengths<-data.frame(chrom=epigenetic_data$chr[epigenetic_data$gene %in% tcga_genelist], chromStart=epigenetic_data$start[epigenetic_data$gene %in% tcga_genelist], chromEnd=epigenetic_data$end[epigenetic_data$gene %in% tcga_genelist], gene=epigenetic_data$gene[epigenetic_data$gene %in% tcga_genelist])
+
+#full join exon coordinates and gene names
+exon_annotations<-full_join(annotated_exons, genelengths, by=c("chromStart"))
+exon_annotations<-exon_annotations %>% dplyr::select(i.chromStart, i.chromEnd, gene)
+
+#genes listed by their exon sizes
+exon_sizes<- exon_annotations %>% mutate(length=i.chromEnd-i.chromStart) %>% group_by(gene) %>% summarize(size=sum(length)) %>% as.data.frame()
+
+#edit exon_sizes to only include genes in cluster_space
+exon_sizes<-exon_sizes[exon_sizes$gene %in% rownames(cluster_space),]
+```
+
+## Functions
+
+```{r}
+
+source("GT_functions.R")
+Rcpp::sourceCpp("GT_multinomial.cpp")
+
+
+goodturing_probs_std <- function(counts = NULL,
+                             r = NULL,
+                             N_r = NULL,
+                             m = NULL,
+                             conf = 1.96,
+                             N0min = 0,
+                             N0 = NULL,
+                             N12_imp = 1,
+                             N = NULL,
+                             gene_length=NULL)  {
+
+  if (all(is.null(counts), is.null(r), is.null(N_r))) {
+    stop("Either provide (a) \'counts\', or (b) \'r\' and \'N_r\'")
+  }
+
+  if(any(is.null(r), is.null(N_r))) {
+    tmp <- rle(sort(unname(counts)))
+    r <- tmp$values
+    N_r <- tmp$lengths
+  }
+
+  r_1_impute <- r_2_impute <- FALSE
+
+  if (any(length(N_r[r == 1]) == 0, N_r[r == 1] == 0)) {
+    N_r <- c(N_r, pmax(N12_imp, 1))
+    r <- c(r, 1)
+    r_1_impute <- TRUE
+  }
+
+  if (any(length(N_r[r == 2]) == 0, N_r[r == 2] == 0)) {
+    N_r <- c(N_r, pmax(N12_imp, 1))
+    r <- c(r, 2)
+    r_2_impute <- TRUE
+  }
+
+  ord <- order(r)
+  r <- r[ord]
+  N_r <- N_r[ord]
+  names(N_r) <- r
+
+  GT <- GoodTuring(r = r, N_r = N_r, m = m, conf = conf)
+
+  if (is.null(N0) & !is.null(N)) {
+    N0 <- N - sum(N_r[r >= 1])
+    if (N0 <= 0) {
+      stop("'N' must be strictly bigger than sum(Nr[r>=1])")
+    }
+  }
+
+  N0est <- ifelse(
+    is.null(N0),
+    max(chao_N0(r = r, N_r = N_r, m = m), N0min),
+    N0
+  )
+
+  N1_adj <- ifelse(r_1_impute, N12_imp, N_r[r == 1])
+  N2_adj <- ifelse(r_2_impute, N12_imp, N_r[r == 2])
+
+  p0 <- N1_adj/N0est/(m+1)
+  se_p0 <- p0 * (1/N1_adj + 1/N0est)
+
+  p_atleast_1new_std_perMB <- 1 - exp(-N1_adj * 1E6 /((m+1) * gene_length))
+  # # using MGF of poisson
+  # exp_tmp <- exp(-1/(m+1))
+  # var_tmp <- exp(N1_adj * (exp_tmp^2 - 1)) - exp(2 * N1_adj * (exp_tmp - 1))
+  # se_p_atleast_1new <- sqrt(var_tmp)
+  # using delta approximation
+  se_p_atleast_1new_std_perMB <- exp(-N1_adj * 1E6/((m+1) * gene_length) ) * 1/(m+1) * sqrt(N1_adj * 1E6/gene_length)
+
+  # adjust the proportions for 1 & 2
+  GT$proportion[1] <- GT$proportion[1] * N_r[r == 1]/N1_adj
+  GT$proportion[2] <- GT$proportion[2] * N_r[r == 2]/N2_adj
+
+
+  if (is.null(counts) | is.null(names(counts))) {
+
+    p_GT <- c(p_atleast_1new_std_perMB, p0, GT$proportion)
+    se_p_GT <- c(se_p_atleast_1new_std_perMB, se_p0, GT$std_error)
+    names(p_GT) <- names(se_p_GT) <-  c(
+      "atleast_1new_perMB",
+      "0",
+      GT$count
+    )
+  } else {
+    tmp_probs <- GT$proportion
+    tmp_se <- GT$std_error
+    names(tmp_probs) <- names(tmp_se) <- GT$count
+
+    p_GT <- unname(c(tmp_probs[as.character(counts)],
+                     p0,
+                     p_atleast_1new_std_perMB))
+    se_p_GT <- unname(c(tmp_se[as.character(counts)],
+                        se_p0,
+                        se_p_atleast_1new_std_perMB))
+    names(p_GT) <- names(se_p_GT) <-  c(
+      names(counts),
+      "each_unseen",
+      "atleast_1new_perMB"
+    )
+
+  }
+
+  attributes(p_GT)
+  attr(p_GT, "N0") <- N0est
+  attr(p_GT, "se") <- se_p_GT
+  attr(p_GT, "smooth_slope_ok") <- GT$slope_ok
+
+  p_GT
+}
+
+
+goodturing_probs(counts=tcga_v_f[grepl("KRAS", tcga_v_f$Variant),]$v_f, m=tcga_v_f[grepl("KRAS", tcga_v_f$Variant),]$n_tumor %>% unique())
+
+goodturing_probs_std(counts=tcga_v_f[grepl("KRAS", tcga_v_f$Variant),]$v_f, m=tcga_v_f[grepl("KRAS", tcga_v_f$Variant),]$n_tumor %>% unique(), gene_length=exon_sizes$size[match("KRAS", exon_sizes$gene)])
+```
+
+```{r}
+kmeans_perturb<-function(x, centers, nstart, iter.max, perturb_prob){
+  k.res<-kmeans(x=x, centers=centers, nstart = nstart, iter.max=iter.max)
+  random_probs=runif(dim(x)[1], 0, 1)
+  tmp<-cbind(k.res$cluster, random_probs)
+  assignments<-ifelse(tmp[,2]<perturb_prob, sample.int(centers, sum(tmp[,2]<perturb_prob), replace=TRUE), tmp[,1])
+  return(assignments)
+}
+
+#rand index calculator
+adjRRand<-function(trcl, prcl){unname(RRand(trcl, prcl)[2])}
+
+calc_GT<-function(cluster_assignments=NULL, standardize=TRUE, scale_variants=TRUE){
+  
+  clusters<-data.frame(gene=rownames(cluster_space), assignments=cluster_assignments)
+  
+  cluster_sizes<-setNames(data.frame(cluster= cluster_assignments, lengths=exon_sizes$size[match(rownames(cluster_space), exon_sizes$gene)]), c("cluster", "lengths")) %>% group_by(cluster) %>% summarize(length=sum(lengths))
+  
+  tcga_clust<-left_join(clusters, tcga[MS == "Non-hypermutated" & !is.na(Cancer_Code),], by=c("gene"="Hugo_Symbol"))
+  colnames(tcga_clust)<-c("gene", "Cluster", "patient_id", "Variant", "Cancer_Code", "MS")
+  setDT(tcga_clust)
+  
+  #filter by nonhypermutated mutation signature and non-NA Cancer Code
+  tcga_v_f <- tcga_clust[MS == "Non-hypermutated" & !is.na(Cancer_Code)][
+    ,
+    # number of tumors per cancer type
+    n_tumor := length(unique(patient_id))
+    ][,
+      # variant frequencies by CLUSTER, cancer type
+      # also save n_tumor per cancer
+      .(v_f = length(unique(patient_id)),
+        n_tumor = n_tumor[1]),
+      by = .(Variant, Cluster)
+      ]
+  
+  #unstandardized probabilities
+  if(standardize==FALSE){
+  tcga_newprob_given_cancer <- suppressWarnings(tcga_v_f[,
+                                                         # Calculate Good Turing probabilities of
+                                                         # at least one new variants per CLUSTER & cancer type
+                                                         {
+                                                           GT_probs <- goodturing_probs(
+                                                             counts = v_f,
+                                                             m = n_tumor[1]
+                                                           )
+                                                           .(p_atleast_1new = GT_probs['atleast_1new'])
+                                                         },
+                                                         by = .(Cluster)
+                                                         ] %>%
+                                                  magrittr::set_rownames(.$Cluster) %>%
+                                                  .[, Cluster := NULL] %>%
+                                                  data.matrix())
+  
+  #return ordered matrix with unstandardized values
+  return(tcga_newprob_given_cancer[order(as.numeric(rownames(tcga_newprob_given_cancer))),] %>% as.matrix(ncol=1))
+  }
+ 
+  #standardized probabilities
+   if(standardize==TRUE & scale_variants==FALSE){
+    tcga_newprob_given_cancer <- suppressWarnings(tcga_v_f[,
+                                                         # Calculate Good Turing probabilities of
+                                                         # at least one new variants per CLUSTER & cancer type
+                                                         {
+                                                           GT_probs <- goodturing_probs(
+                                                             counts = v_f,
+                                                             m = n_tumor[1]
+                                                           )
+                                                           .(p_atleast_1new_per10kb = GT_probs['atleast_1new'])
+                                                         },
+                                                         by = .(Cluster)
+                                                         ] %>%
+                                                  magrittr::set_rownames(.$Cluster) %>%
+                                                  .[, Cluster := NULL] %>%
+                                                  data.matrix())
+    
+    GT_probs<-tcga_newprob_given_cancer[order(as.numeric(rownames(tcga_newprob_given_cancer))),]
+    tcga_newprob_given_cancerperMb<-GT_probs *1E6/cluster_sizes$length
+    return(tcga_newprob_given_cancerperMb %>% as.matrix(ncol=1))
+  }
+
+  #standardized probabilities where VARIANTS are scaled
+  if(standardize==TRUE & scale_variants==TRUE){
+    
+    tcga_v_f<-left_join(tcga_v_f, cluster_sizes, by=c("Cluster"="cluster"))
+    
+    tcga_newprob_given_cancer <- suppressWarnings(tcga_v_f[,
+                                                         # Calculate Good Turing probabilities of
+                                                         # at least one new variants per CLUSTER & cancer type
+                                                         {
+                                                           GT_probs <- goodturing_probs_std(
+                                                             counts = v_f,
+                                                             m = n_tumor[1],
+                                                             gene_length = length
+                                                           )
+                                                           .(p_atleast_1new_perMb = GT_probs['atleast_1new_perMB'])
+                                                         },
+                                                         by = .(Cluster)
+                                                         ] %>%
+                                                  magrittr::set_rownames(.$Cluster) %>%
+                                                  .[, Cluster := NULL] %>%
+                                                  data.matrix())
+  return(tcga_newprob_given_cancer[order(as.numeric(rownames(tcga_newprob_given_cancer))),] %>% as.matrix(ncol=1))
+  }
+}
+
+calc_GT(cluster_assignments, standardize=FALSE)
+calc_GT(cluster_assignments, standardize=TRUE, scale_variants=TRUE)
+calc_GT(cluster_assignments, standardize=TRUE, scale_variants=FALSE)
+
+calc_NMI<-function(cluster_assignments=NULL, standardize=TRUE, scale_variants=TRUE){
+  
+  tcga_newprob_given_cancer<-calc_GT(cluster_assignments=cluster_assignments, standardize=standardize, scale_variants=scale_variants)
+  
+  cancer_npatient <- tcga[
+    !is.na(Cancer_Code) & MS == "Non-hypermutated",
+    .(cancer_npatient = length(unique(patient_id))),
+    by = Cancer_Code
+    ][,
+      cancer_rf := cancer_npatient/sum(cancer_npatient)
+      ]
+  
+  cancer_prob <- cancer_npatient$cancer_rf %>%
+    setNames(cancer_npatient$Cancer_Code)
+  
+  # calc_minfo has two main arguments:
+  # (a) prob_mat: matrix (( p_gc )), where
+  # p_ij = P(Event associated with gene - g | Cancer - c)
+  # and (b) cancer_prob: vector ( p_c ) where p_c = P(Cancer - c).
+  # names(cancer_prob) and colnames(prob_mat) should be identical
+  # The function will return a vector
+  # of length nrow(prob_mat), for all genes in prob_mat
+  
+  nmi <- calc_minfo(
+    tcga_newprob_given_cancer,
+    cancer_prob,
+    binary_minfo = FALSE,
+    normalize = TRUE
+  )
+  
+  # see the top 20
+  return(nmi)
+}
+
+calc_NMI(cluster_assignments, standardize=FALSE)
+calc_NMI(cluster_assignments, standardize=TRUE, scale_variants=FALSE)
+calc_NMI(cluster_assignments, standardize=TRUE, scale_variants=TRUE)
+```
+
+## Cluster Looseness or Tightness
+
+```{r}
+cluster::silhouette(cluster_assignments, cluster_space, )
+```
+
+

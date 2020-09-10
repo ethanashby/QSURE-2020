@@ -1,0 +1,923 @@
+---
+title: "Week 6 Std"
+author: "Ethan Ashby"
+date: "7/6/2020"
+output: html_document
+---
+
+```{r packages and data}
+library(dplyr)
+library(magrittr)
+library(knitr)
+library(devtools)
+library(magrittr)
+library(tidyverse)
+library(data.table)
+#options(buildtools.check = function(action) TRUE )
+#install_github("https://github.com/c7rishi/variantprobs.git")
+library(variantprobs)
+library(rvest)
+library(reshape)
+library(boot)
+library(e1071)
+library(drc)
+library(DescTools)
+library(lattice)
+library(phyclust)
+library(Rcpp)
+library(ggrepel)
+source("calc_minfo.R")
+
+data(tcga)
+tcga_genelist<-tcga[MS == "Non-hypermutated" & !is.na(Cancer_Code),]$Hugo_Symbol %>% unique()
+```
+
+```{r}
+kmeans_perturb<-function(x, centers, nstart, iter.max, perturb_prob){
+  k.res<-kmeans(x=x, centers=centers, nstart = nstart, iter.max=iter.max)
+  random_probs=runif(dim(x)[1], 0, 1)
+  tmp<-cbind(k.res$cluster, random_probs)
+  table(k.res$cluster) %>% c()/560
+  if(k.res$cluster)
+  assignments<-ifelse(tmp[,2]<perturb_prob, sample.int(centers, sum(tmp[,2]<perturb_prob), replace=TRUE), tmp[,1])
+  return(assignments)
+}
+
+#rand index calculator
+adjRRand<-function(trcl, prcl){unname(RRand(trcl, prcl)[2])}
+
+source("GT_functions.R")
+Rcpp::sourceCpp("GT_multinomial.cpp")
+
+
+goodturing_probs_std <- function(counts = NULL,
+                             r = NULL,
+                             N_r = NULL,
+                             m = NULL,
+                             conf = 1.96,
+                             N0min = 0,
+                             N0 = NULL,
+                             N12_imp = 1,
+                             N = NULL,
+                             gene_length=NULL,
+                             scale_by=1E6)  {
+
+  if (all(is.null(counts), is.null(r), is.null(N_r))) {
+    stop("Either provide (a) \'counts\', or (b) \'r\' and \'N_r\'")
+  }
+
+  if(any(is.null(r), is.null(N_r))) {
+    tmp <- rle(sort(unname(counts)))
+    r <- tmp$values
+    N_r <- tmp$lengths
+  }
+
+  r_1_impute <- r_2_impute <- FALSE
+
+  if (any(length(N_r[r == 1]) == 0, N_r[r == 1] == 0)) {
+    N_r <- c(N_r, pmax(N12_imp, 1))
+    r <- c(r, 1)
+    r_1_impute <- TRUE
+  }
+
+  if (any(length(N_r[r == 2]) == 0, N_r[r == 2] == 0)) {
+    N_r <- c(N_r, pmax(N12_imp, 1))
+    r <- c(r, 2)
+    r_2_impute <- TRUE
+  }
+
+  ord <- order(r)
+  r <- r[ord]
+  N_r <- N_r[ord]
+  names(N_r) <- r
+
+  GT <- GoodTuring(r = r, N_r = N_r, m = m, conf = conf)
+
+  if (is.null(N0) & !is.null(N)) {
+    N0 <- N - sum(N_r[r >= 1])
+    if (N0 <= 0) {
+      stop("'N' must be strictly bigger than sum(Nr[r>=1])")
+    }
+  }
+
+  N0est <- ifelse(
+    is.null(N0),
+    max(chao_N0(r = r, N_r = N_r, m = m), N0min),
+    N0
+  )
+
+  N1_adj <- ifelse(r_1_impute, N12_imp, N_r[r == 1])
+  N2_adj <- ifelse(r_2_impute, N12_imp, N_r[r == 2])
+
+  p0 <- N1_adj/N0est/(m+1)
+  se_p0 <- p0 * (1/N1_adj + 1/N0est)
+
+  p_atleast_1new_std_perMB <- 1 - exp(-N1_adj * scale_by /((m+1) * gene_length))
+  # # using MGF of poisson
+  # exp_tmp <- exp(-1/(m+1))
+  # var_tmp <- exp(N1_adj * (exp_tmp^2 - 1)) - exp(2 * N1_adj * (exp_tmp - 1))
+  # se_p_atleast_1new <- sqrt(var_tmp)
+  # using delta approximation
+  se_p_atleast_1new_std_perMB <- exp(-N1_adj * scale_by/((m+1) * gene_length) ) * 1/((m+1) * gene_length/scale_by) * sqrt(N1_adj)
+
+  # adjust the proportions for 1 & 2
+  GT$proportion[1] <- GT$proportion[1] * N_r[r == 1]/N1_adj
+  GT$proportion[2] <- GT$proportion[2] * N_r[r == 2]/N2_adj
+
+
+  if (is.null(counts) | is.null(names(counts))) {
+
+    p_GT <- c(p_atleast_1new_std_perMB, p0, GT$proportion)
+    se_p_GT <- c(se_p_atleast_1new_std_perMB, se_p0, GT$std_error)
+    names(p_GT) <- names(se_p_GT) <-  c(
+      "atleast_1new",
+      "0",
+      GT$count
+    )
+  } else {
+    tmp_probs <- GT$proportion
+    tmp_se <- GT$std_error
+    names(tmp_probs) <- names(tmp_se) <- GT$count
+
+    p_GT <- unname(c(tmp_probs[as.character(counts)],
+                     p0,
+                     p_atleast_1new_std_perMB))
+    se_p_GT <- unname(c(tmp_se[as.character(counts)],
+                        se_p0,
+                        se_p_atleast_1new_std_perMB))
+    names(p_GT) <- names(se_p_GT) <-  c(
+      names(counts),
+      "each_unseen",
+      "atleast_1new"
+    )
+
+  }
+
+  attributes(p_GT)
+  attr(p_GT, "N0") <- N0est
+  attr(p_GT, "se") <- se_p_GT
+  attr(p_GT, "smooth_slope_ok") <- GT$slope_ok
+
+  p_GT
+}
+```
+
+```{r}
+#######smaller gene set
+top_genes <- tcga[
+  MS == "Non-hypermutated",
+  ][,
+    n_tumor := length(unique(patient_id))
+    ][,
+      .(g_f = length(unique(patient_id)),
+        n_tumor = n_tumor[1]),
+      by = Hugo_Symbol
+      ][,
+        g_rf := g_f/n_tumor
+        ][
+          g_rf >= 0.01,
+          ]$Hugo_Symbol
+
+########redefine cluster space
+cluster_space<-cbind(epigenetic_data$expression_CCLE, epigenetic_data$replication_time, epigenetic_data$noncoding_mutation_rate, epigenetic_data$local_GC_content, epigenetic_data$HiC_compartment)
+rownames(cluster_space)<-epigenetic_data$gene
+cluster_space<-cluster_space[complete.cases(cluster_space),]
+cluster_space<-scale(cluster_space)
+cluster_space<-as.data.frame(cluster_space)
+colnames(cluster_space)<-c("expression", "rep_time", "nc_mut_rate", "loc_GC_cont", "HiC")
+#only include clusters in tcga
+cluster_space<-cluster_space[rownames(cluster_space) %in% top_genes, ]
+
+
+#######Calculate exon sizes
+exome_sizes<-data.table::fread("gencode.v19.basic.exome.bed")
+###replace X 
+exome_sizes$V1<-as.numeric(exome_sizes$V1)
+exome_sizes$V1[is.na(exome_sizes$V1)]<-23
+
+exome_sizes$V2<-as.numeric(exome_sizes$V2)
+exome_sizes$V3<-as.numeric(exome_sizes$V3)
+exome_sizes<-exome_sizes[complete.cases(exome_sizes),]
+colnames(exome_sizes)<-c("chrom", "chromStart", "chromEnd")
+
+genelengths<-data.frame(chrom=epigenetic_data$chr[epigenetic_data$gene %in% tcga_genelist], chromStart=epigenetic_data$start[epigenetic_data$gene %in% tcga_genelist], chromEnd=epigenetic_data$end[epigenetic_data$gene %in% tcga_genelist])
+
+setDT(exome_sizes)
+setDT(genelengths)
+setkey(genelengths)
+#if any exon overlaps with gene coordinates, then join them
+annotated_exons<-foverlaps(exome_sizes, genelengths, type="any", nomatch=0L)
+
+genelengths<-data.frame(chrom=epigenetic_data$chr[epigenetic_data$gene %in% tcga_genelist], chromStart=epigenetic_data$start[epigenetic_data$gene %in% tcga_genelist], chromEnd=epigenetic_data$end[epigenetic_data$gene %in% tcga_genelist], gene=epigenetic_data$gene[epigenetic_data$gene %in% tcga_genelist])
+
+#full join exon coordinates and gene names
+exon_annotations<-full_join(annotated_exons, genelengths, by=c("chromStart"))
+exon_annotations<-exon_annotations %>% dplyr::select(i.chromStart, i.chromEnd, gene)
+
+#genes listed by their exon sizes
+exon_sizes<- exon_annotations %>% mutate(length=i.chromEnd-i.chromStart) %>% group_by(gene) %>% summarize(size=sum(length)) %>% as.data.frame()
+
+
+
+#edit exon_sizes to only include genes in cluster_space
+exon_sizes<-exon_sizes[exon_sizes$gene %in% rownames(cluster_space),]
+```
+
+```{r Functions across tissue types}
+calc_GT<-function(cluster_assignments=NULL, standardize=FALSE, scale_variants=FALSE, scale_by=1E4){
+  
+  clusters<-data.frame(gene=rownames(cluster_space), assignments=cluster_assignments)
+  
+  cluster_sizes<-setNames(data.frame(cluster= cluster_assignments, lengths=exon_sizes$size[match(rownames(cluster_space), exon_sizes$gene)]), c("cluster", "lengths")) %>% group_by(cluster) %>% summarize(length=sum(lengths))
+  
+  
+  #filter by nonhypermutated mutation signature and non-NA Cancer Code
+ tcga_v_f <- tcga[
+  # filter out all hypermutated tumors
+  # & tumors with unknown cancer
+  MS == "Non-hypermutated" & !is.na(Cancer_Code),
+  ][
+    ,
+    # number of tumors per cancer type
+    n_tumor := length(unique(patient_id)),
+    by = Cancer_Code
+    ][,
+      # variant frequencies by gene, cancer type
+      # also save n_tumor per cancer
+      .(v_f = length(unique(patient_id)),
+        n_tumor = n_tumor[1]),
+      by = .(Variant, Hugo_Symbol, Cancer_Code)
+      ]
+ 
+  #unstandardized probabilities
+  if(standardize==FALSE){
+  tcga_v_f<-left_join(tcga_v_f, clusters, by=c("Hugo_Symbol"="gene"))
+  colnames(tcga_v_f)<-c("Variant", "Hugo_Symbol", "Cancer_Code", "v_f", "n_tumor", "Cluster")
+  tcga_newprob_given_cancer <- suppressWarnings(tcga_v_f[
+  # keep only top_genes
+  Hugo_Symbol %in% rownames(cluster_space),
+  ][,
+                                                         # Calculate Good Turing probabilities of
+                                                         # at least one new variants per CLUSTER & cancer type
+                                                         {
+                                                           GT_probs <- goodturing_probs(
+                                                             counts = v_f,
+                                                             m = n_tumor[1]
+                                                           )
+                                                           .(p_atleast_1new = GT_probs['atleast_1new'])
+                                                         },
+                                                         by = .(Cluster, Cancer_Code)
+                                                         ] 
+                                                %>%
+                                                    dcast(
+                                                        Cluster ~ Cancer_Code,
+                                                        value.var = "p_atleast_1new",
+                                                        fill = 1 - exp(- 1/(length(unique(tcga$patient_id)) + 1))
+                                                           ) %>%
+                                                  magrittr::set_rownames(.$Cluster) %>%
+                                                  .[, Cluster := NULL] %>%
+                                                  data.matrix())
+  
+  #return ordered matrix with unstandardized values
+  return(tcga_newprob_given_cancer)
+  }
+ 
+  #standardized probabilities
+   if(standardize==TRUE & scale_variants==FALSE){
+    tcga_v_f<-left_join(tcga_v_f, clusters, by=c("Hugo_Symbol"="gene"))
+    colnames(tcga_v_f)<-c("Variant", "Hugo_Symbol", "Cancer_Code", "v_f", "n_tumor", "Cluster")
+    tcga_newprob_given_cancer <- suppressWarnings(tcga_v_f[
+          # keep only top_genes
+          Hugo_Symbol %in% rownames(cluster_space),
+          ][,
+                                                         # Calculate Good Turing probabilities of
+                                                         # at least one new variants per CLUSTER & cancer type
+                                                         {
+                                                           GT_probs <- goodturing_probs(
+                                                             counts = v_f,
+                                                             m = n_tumor[1]
+                                                           )
+                                                           .(p_atleast_1new = GT_probs['atleast_1new'])
+                                                         },
+                                                         by = .(Cluster, Cancer_Code)
+                                                         ] 
+                                                %>%
+                                                    dcast(
+                                                        Cluster ~ Cancer_Code,
+                                                        value.var = "p_atleast_1new",
+                                                        fill = 1 - exp(- 1/(length(unique(tcga$patient_id)) + 1))
+                                                           ) %>%
+                                                  magrittr::set_rownames(.$Cluster) %>%
+                                                  .[, Cluster := NULL] %>%
+                                                  data.matrix())
+    
+    tcga_newprob_given_cancerper_scale_by<-tcga_newprob_given_cancer * scale_by/cluster_sizes$length
+    return(tcga_newprob_given_cancerper_scale_by)
+  }
+
+  #standardized probabilities where VARIANTS are scaled
+  if(standardize==TRUE & scale_variants==TRUE){
+    
+    tcga_v_f<-left_join(tcga_v_f, clusters, by=c("Hugo_Symbol"="gene"))
+    colnames(tcga_v_f)<-c("Variant", "Hugo_Symbol", "Cancer_Code", "v_f", "n_tumor", "Cluster")
+    tcga_v_f<-left_join(tcga_v_f, cluster_sizes, by=c("Cluster"="cluster"))
+    
+    tcga_newprob_given_cancer <- suppressWarnings(tcga_v_f[
+          # keep only top_genes
+          Hugo_Symbol %in% rownames(cluster_space),
+          ][,
+                                                         # Calculate Good Turing probabilities of
+                                                         # at least one new variants per CLUSTER & cancer type
+                                                         {
+                                                           GT_probs <- goodturing_probs_std(
+                                                             counts = v_f,
+                                                             m = n_tumor[1],
+                                                             gene_length = length,
+                                                             scale_by= scale_by
+                                                           )
+                                                           .(p_atleast_1new = GT_probs['atleast_1new'])
+                                                         },
+                                                         by = .(Cluster, Cancer_Code)
+                                                         ] 
+                                                %>%
+                                                    dcast(
+                                                        Cluster ~ Cancer_Code,
+                                                        value.var = "p_atleast_1new",
+                                                        fill = 1 - exp(- 1/(length(unique(tcga$patient_id)) + 1))
+                                                           ) %>%
+                                                  magrittr::set_rownames(.$Cluster) %>%
+                                                  .[, Cluster := NULL] %>%
+                                                  data.matrix())
+    
+  return(tcga_newprob_given_cancer)
+  }
+}
+
+calc_NMI<-function(cluster_assignments=NULL, standardize=FALSE, scale_variants=FALSE, scale_by=1E4, normalize=TRUE){
+  
+  a<-cluster_assignments
+  b<-standardize
+  c<-scale_variants
+  d<-scale_by
+  
+  tcga_newprob_given_cancer<-calc_GT(cluster_assignments=a, standardize=b, scale_variants=c, scale_by = d)
+  
+  cancer_npatient <- tcga[
+    !is.na(Cancer_Code) & MS == "Non-hypermutated",
+    .(cancer_npatient = length(unique(patient_id))),
+    by = Cancer_Code
+    ][,
+      cancer_rf := cancer_npatient/sum(cancer_npatient)
+      ]
+  
+    cancer_prob <- cancer_npatient$cancer_rf %>%
+      setNames(cancer_npatient$Cancer_Code)
+  
+  # calc_minfo has two main arguments:
+  # (a) prob_mat: matrix (( p_gc )), where
+  # p_ij = P(Event associated with gene - g | Cancer - c)
+  # and (b) cancer_prob: vector ( p_c ) where p_c = P(Cancer - c).
+  # names(cancer_prob) and colnames(prob_mat) should be identical
+  # The function will return a vector
+  # of length nrow(prob_mat), for all genes in prob_mat
+  
+if(normalize==TRUE){
+  nmi <- calc_minfo(
+    tcga_newprob_given_cancer,
+    cancer_prob,
+    binary_minfo = FALSE,
+    normalize = TRUE
+  )
+}
+if(normalize==FALSE){
+    nmi <- calc_minfo(
+    tcga_newprob_given_cancer,
+    cancer_prob,
+    binary_minfo = FALSE,
+    normalize = FALSE
+  )
+}
+  # see the top 20
+  return(nmi)
+}
+```
+
+```{r Function irrespective of tissue type}
+calc_genes_GT_SE<-function(genes){
+  
+  lengths<-exon_sizes[genes %in% exon_sizes$gene,]
+  
+  tcga_v_f <- tcga[
+  # filter out all hypermutated tumors
+  # & tumors with unknown cancer
+  MS == "Non-hypermutated" & !is.na(Cancer_Code),
+  ][
+    ,
+    # number of tumors per cancer type
+    n_tumor := length(unique(patient_id)),
+    ][,
+      # variant frequencies by gene, cancer type
+      # also save n_tumor per cancer
+      .(v_f = length(unique(patient_id)),
+        n_tumor = n_tumor[1]),
+      by = .(Variant, Hugo_Symbol)
+      ]
+  
+  tcga_v_f<-left_join(tcga_v_f, lengths, by=c("Hugo_Symbol"="gene"))
+  
+  tcga_newprob_given_cancer <- tcga_v_f[
+  # keep only top_genes
+  Hugo_Symbol %in% genes,
+  ][,
+    # Calculate Good Turing probabilities of
+    # at least one new variants per gene & cancer type
+    {
+      GT_probs <- goodturing_probs_std(
+        counts = v_f,
+        m = n_tumor[1],
+        gene_length=size,
+        scale_by=5E4
+      )
+      .(p_atleast_1new_v = GT_probs['atleast_1new'])
+    },
+    by = .(Hugo_Symbol)
+    ]
+  
+  tcga_se_given_cancer<-tcga_v_f[
+  # keep only top_genes
+  Hugo_Symbol %in% genes,
+  ][,
+    # Calculate Good Turing probabilities of
+    # at least one new variants per gene & cancer type
+    {
+      GT_probs <- goodturing_probs_std(
+        counts = v_f,
+        m = n_tumor[1],
+        gene_length= size,
+        scale_by=5E4
+      )
+      .(p_atleast_1new_se = attributes(GT_probs)[['se']]['atleast_1new'])
+      
+    },
+    by = .(Hugo_Symbol)
+    ]
+  
+  return(left_join(tcga_newprob_given_cancer, tcga_se_given_cancer, by="Hugo_Symbol"))
+}
+```
+
+```{r what do probabilities look like, eval=F}
+
+example<-calc_GT(df10_0perturb$X2, standardize = FALSE)
+colMeans(t(example))
+max_probs<-apply(t(example), 2, function(x) max(x, na.rm = TRUE))
+NMIex<-calc_NMI(df10_0perturb$X2, standardize=FALSE)
+Mean_standardize_prob<-calc_GT(df10_0perturb$X2, standardize = TRUE, scale_variants = TRUE, scale_by= 5E4)
+colMeans(t(Mean_standardize_prob))
+apply(t(Mean_standardize_prob), 2, function(x) max(x, na.rm = TRUE))
+NMI_std<-calc_NMI(df10_0perturb$X2, standardize=TRUE, scale_variants=TRUE, scale_by=5E4)
+
+cbind("Mean_Tissue_Specific_Probability_Unstd"=colMeans(t(example)), "Max_Tissue_Specific_Probability_Unstd"=max_probs, "NMI_unstd"=NMIex, "Mean_prob_per50kb"=colMeans(t(Mean_standardize_prob)), "Max_prob_per50kb"=apply(t(Mean_standardize_prob), 2, function(x) max(x, na.rm = TRUE)), "NMI_per50kb"=NMI_std) %>% knitr::kable()
+
+levelplot(t(Mean_standardize_prob), ylab="Metagene Number", xlab="Cancer Type", scales=list(x=list(rot=90)), col.regions=rev(heat.colors(100)))
+
+
+example<-calc_GT(no_pool_assignments, standardize = FALSE)
+colMeans(t(example))
+max_probs<-apply(t(example), 2, function(x) max(x, na.rm = TRUE))
+NMIex<-calc_NMI(no_pool_assignments, standardize=FALSE)
+Mean_standardize_prob<-calc_GT(no_pool_assignments, standardize = TRUE, scale_variants = TRUE, scale_by= 5E4)
+colMeans(t(Mean_standardize_prob))
+apply(t(Mean_standardize_prob), 2, function(x) max(x, na.rm = TRUE))
+NMI_std<-calc_NMI(no_pool_assignments, standardize=TRUE, scale_variants=TRUE, scale_by=5E4)
+
+cbind("Mean_Tissue_Specific_Probability_Unstd"=colMeans(t(example)), "Max_Tissue_Specific_Probability_Unstd"=max_probs, "NMI_unstd"=NMIex, "Mean_prob_per50kb"=colMeans(t(Mean_standardize_prob)), "Max_prob_per50kb"=apply(t(Mean_standardize_prob), 2, function(x) max(x, na.rm = TRUE)), "NMI_per50kb"=NMI_std) %>% knitr::kable()
+
+NMI_std[rev(order(NMI_std))] %>% names() %>% as.numeric()
+levelplot(Mean_standardize_prob[NMI_std[rev(order(NMI_std))] %>% names() %>% as.numeric() %>% head(20),], ylab="Metagene Number", xlab="Cancer Type", col.regions=rev(heat.colors(100)))
+
+```
+
+## No pooling Z-score
+
+```{r}
+GT_SEs<-calc_genes_GT_SE(rownames(cluster_space))
+Z_scores<-data.frame("Gene"=rownames(cluster_space), "GT Z_score"=GT_SEs$p_atleast_1new_v/GT_SEs$p_atleast_1new_se)
+Z_scores$Gene<-factor(Z_scores$Gene, levels=Z_scores[rev(order(Z_scores$GT.Z_score)),]$Gene)
+Z_scores[rev(order(Z_scores$GT.Z_score)),][c(1:10, 550:560),] %>% ggplot()+geom_bar(aes(x=Gene, y=GT.Z_score), stat="identity")+ylab("Good-Turing Z Score")+theme_bw()+theme(axis.text.x=element_text(angle=90), axis.title.x=element_blank())
+```
+
+## Plot length x NMI, MI, GT prob standardized & unstandardized
+
+```{r}
+no_pool_assignments<-matrix(seq(1, 560))
+NMI_unstd<-apply(no_pool_assignments, MARGIN=2, FUN=calc_NMI, standardize=FALSE)
+NMI_per50kb<-apply(no_pool_assignments, MARGIN=2, FUN=calc_NMI, standardize=TRUE, scale_variants=TRUE, scale_by=5E4)
+MI_unstd<-apply(no_pool_assignments, MARGIN=2, FUN=calc_NMI, standardize=FALSE, normalize=FALSE)
+MI_per50kb<-apply(no_pool_assignments, MARGIN=2, FUN=calc_NMI, standardize=TRUE, scale_variants=TRUE, scale_by=5E4, normalize=FALSE)
+GT_unstd<-calc_GT(no_pool_assignments, standardize=FALSE)
+unstd_med_max<-cbind("Median_GT"=apply(GT_unstd, MARGIN=1, median), "Max_GT"=apply(GT_unstd, MARGIN=1, max))
+GT_per50kb<-calc_GT(no_pool_assignments, standardize=TRUE, scale_variants=TRUE, scale_by=5E4)
+std_med_max=cbind("Median_GT_per50kb"=apply(GT_per50kb, MARGIN=1, median), "Max_GT_per50kb"=apply(GT_unstd, MARGIN=1, max))
+
+to_plot<-data.frame("Gene"=rownames(cluster_space), "NMI_Unstandardized"=NMI_unstd, "NMI_per50kb"=NMI_per50kb, "MI_Unstandardized"=MI_unstd, "MI_per50kb"=MI_per50kb, unstd_med_max, std_med_max)
+
+to_plot<-left_join(to_plot, exon_sizes, by=c("Gene"="gene"))
+
+NMI_std_plot<-pivot_longer(to_plot %>% dplyr::select(Gene, size, NMI_Unstandardized, NMI_per50kb), cols=c("NMI_Unstandardized", "NMI_per50kb"), names_to="NMI")
+
+NMI_std_plot %>% ggplot()+geom_point(aes(x=size/1E3, y=value, color=NMI))+xlab("Gene Length (kB)")+ylab("NMI")+theme_bw()+facet_wrap(~NMI)+labs(subtitle = paste("Pearson corr:", round(cor(to_plot[rev(order(to_plot$NMI_Unstandardized)),]$NMI_per50kb, to_plot[rev(order(to_plot$NMI_per50kb)),]$NMI_per50kb, method="pearson"), 2), '    ', "Spearman corr:", round(cor(to_plot[rev(order(to_plot$NMI_Unstandardized)),]$NMI_per50kb, to_plot[rev(order(to_plot$NMI_per50kb)),]$NMI_per50kb, method="spearman"), 2)))+geom_label_repel(data=subset(NMI_std_plot, Gene %in% c("VHL", "KRAS", "TP53", "BRAF", "APC", "PTEN", "NOTCH1") | value>0.075), aes(x=size/1E3, y=value, label = Gene),
+                  box.padding   = 0.35, 
+                  point.padding = 0.5,
+                  segment.alpha = 0.3,
+                  nudge_x=0.5,
+                  direction="y",
+                  hjust= 1,
+                  size=3,
+                  segment.color = 'grey50')+theme(legend.position="none", axis.title=element_text(size=18), axis.text.x=element_text(size=15, angle=90), axis.text.y=element_text(size=15), strip.text=element_text(size=18))+coord_trans(x="log10")
+
+
+```
+
+
+## 50kb standardization 
+
+```{r}
+
+#k=560
+no_pool_assignments<-matrix(seq(1, 560))
+unstd560<-apply(no_pool_assignments, MARGIN=2, FUN=calc_NMI, standardize=FALSE)
+stdvar560_per50kb<-apply(no_pool_assignments, MARGIN=2, FUN=calc_NMI, standardize=TRUE, scale_variants=TRUE, scale_by=5E4)
+
+#k=10
+cluster_membership<-lapply(X=1:1000, FUN= function(X) kmeans_perturb(cluster_space, 10, nstart = 1, iter.max=20, perturb_prob=0))
+df10_0perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+
+stdvar10_per50kb<-suppressWarnings(apply(df10_0perturb, MARGIN=2, FUN=calc_NMI, standardize=TRUE, scale_variants=TRUE, scale_by=5E4))
+
+#k=25
+cluster_membership<-lapply(X=1:1000, FUN= function(X) kmeans_perturb(cluster_space, 25, nstart = 1, iter.max=20, perturb_prob=0))
+df25_0perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+stdvar25_per50kb<-apply(df25_0perturb, MARGIN=2, FUN=calc_NMI, standardize=TRUE, scale_variants=TRUE, scale_by=5E4)
+
+#k=50
+cluster_membership<-lapply(X=1:1000, FUN= function(X) kmeans_perturb(cluster_space, 50, nstart = 1, iter.max=20, perturb_prob=0))
+df50_0perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+stdvar50_per50kb<-apply(df50_0perturb, MARGIN=2, FUN=calc_NMI, standardize=TRUE, scale_variants=TRUE, scale_by=5E4)
+```
+
+## Presentation Figures
+```{r}
+source('http://www.sthda.com/upload/rquery_wordcloud.r')
+rquery.wordcloud("https://www.cancer.gov/about-nci/organization/ccg/research/structural-genomics/tcga", type="url", lang="english", min.freq=1)
+
+tcga_varfreqs<-tcga[
+  # filter out all hypermutated tumors
+  # & tumors with unknown cancer
+  !is.na(Cancer_Code),
+  ][
+    ,
+    # number of tumors per cancer type
+    n_tumor := length(unique(patient_id)),
+    by = Cancer_Code
+    ][,
+      # variant frequencies by gene, cancer type
+      # also save n_tumor per cancer
+      .(v_f = length(unique(patient_id)),
+        n_tumor = n_tumor[1]),
+      by = .(Variant, Hugo_Symbol)
+      ]
+
+library(scales)
+mylog10_trans <- function (base = 10) 
+{
+  trans <- function(x) log(x + 1, base)
+  inv <- function(x) base^x
+  trans_new(paste0("log-", format(base)), trans, inv, log_breaks(base = base), 
+            domain = c(1e-100, Inf))
+}
+
+tcga_varfreqs %>% ggplot()+geom_histogram(aes(x=v_f), binwidth = 1)+theme_bw()+xlab("r")+ylab(expression("N"[r]))+ggtitle("TCGA variant frequencies")+scale_y_continuous(trans="mylog10", labels = scales::comma)+theme(panel.grid=element_blank(), axis.title=element_text(size=18), axis.text=element_text(size=14), title=element_text(size=22))
+```
+
+## GMM-EM for better clustering
+```{r}
+library(ClusterR)
+ClusterR::Optimal_Clusters_GMM(cluster_space, max_clusters=50)
+ClusterR::GMM(cluster_space, gaussian_comps=15, dist_mode="maha_dist", km_iter = 10,
+              em_iter = 5,)
+```
+
+## Example of genes with GT probs
+
+```{r}
+
+nmi_vec_return<-function(metagene_manua=NULL, starting_reps=c(5,10), n_tumor=50, add=FALSE, multiply=TRUE, factor=seq(1, 500, by=5), tissue_probs=c(0.5, 0.5)){
+#gene
+genetypea<-goodturing_probs_std(rep(1, starting_reps[1]), m=n_tumor, gene_length=1, scale_by=1)['atleast_1new']
+genetypeb<-goodturing_probs_std(rep(1, starting_reps[2]), m=n_tumor, gene_length=1, scale_by=1)['atleast_1new']
+gene<-c(genetypea, genetypeb)
+#metagene (gene a + gene a)
+
+if(multiply==TRUE){
+nmi_vec<-c()
+for (i in 1:length(factor)){
+metagenetypea<-goodturing_probs(rep(1, starting_reps[1]*factor[i]), m=n_tumor)['atleast_1new']
+metagenetypeb<-goodturing_probs(rep(1, starting_reps[2]*factor[i]), m=n_tumor)['atleast_1new']
+metagene<-c(metagenetypea, metagenetypeb)
+print(metagene)
+
+tissue_probs<-tissue_probs
+
+nmi_vec<-c(nmi_vec, calc_minfo(rbind(gene, metagene), tissue_probs, binary_minfo = FALSE, normalize=TRUE)[2])
+}
+}
+
+if(add==TRUE){
+  nmi_vec<-c()
+for (i in 1:length(factor)){
+metagenetypea<-goodturing_probs(rep(1, starting_reps[1]+factor[i]), m=n_tumor)['atleast_1new']
+metagenetypeb<-goodturing_probs(rep(1, starting_reps[2]+factor[i]), m=n_tumor)['atleast_1new']
+metagene<-c(metagenetypea, metagenetypeb)
+
+tissue_probs<-tissue_probs
+
+nmi_vec<-c(nmi_vec, calc_minfo(rbind(gene, metagene), tissue_probs, binary_minfo = FALSE, normalize=TRUE)[2])
+}
+}
+
+
+nmi_vec[is.nan(nmi_vec)]<-0
+return(nmi_vec)}
+
+plot(seq(1, 500, by=5), suppressWarnings(nmi_vec_return(n_tumor=50)), type="l", col="red", xlab="Factor to multiply N_1 by", ylab="NMI")
+title(sub=c("Gene 1 N1=5, Gene 2 N1=10,  2 Tissues each with prob=0.5"))
+lines(seq(1, 500, by=5), suppressWarnings(nmi_vec_return(n_tumor=100)), col="blue")
+lines(seq(1, 500, by=5), suppressWarnings(nmi_vec_return(n_tumor=500)), col="green")
+
+plot(seq(1, 500, by=5), suppressWarnings(nmi_vec_return(starting_reps=c(1,2))), type="l", col="red")
+lines(seq(1, 500, by=5), suppressWarnings(nmi_vec_return(starting_reps=c(2,4))), col="blue")
+lines(seq(1, 500, by=5), suppressWarnings(nmi_vec_return(starting_reps=c(5,10))), col="green")
+
+plot(seq(1, 500, by=5), suppressWarnings(nmi_vec_return(tissue_probs=c(0.5,0.5))), type="l", col="red")
+lines(seq(1, 500, by=5), suppressWarnings(nmi_vec_return(tissue_probs=c(0.1,0.9))), col="blue")
+lines(seq(1, 500, by=5), suppressWarnings(nmi_vec_return(tissue_probs=c(0.05,0.95))), col="green")
+```
+
+## No standardization NMIs by k and perturb
+
+```{r}
+####k=10
+#0 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 10, nstart = 1, iter.max=20, perturb_prob=0))
+df10_0perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k10_0perturb<-suppressWarnings(apply(df10_0perturb, MARGIN=2, FUN=calc_NMI))
+#0.1 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 10, nstart = 1, iter.max=20, perturb_prob=0.1))
+df10_0.1perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k10_0.1perturb<-suppressWarnings(apply(df10_0.1perturb, MARGIN=2, FUN=calc_NMI))
+#0.25 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 10, nstart = 1, iter.max=20, perturb_prob=0.25))
+df10_0.25perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k10_0.25perturb<-suppressWarnings(apply(df10_0.25perturb, MARGIN=2, FUN=calc_NMI))
+#0.5 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 10, nstart = 1, iter.max=20, perturb_prob=0.5))
+df10_0.5perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k10_0.5perturb<-suppressWarnings(apply(df10_0.5perturb, MARGIN=2, FUN=calc_NMI))
+#1 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 10, nstart = 1, iter.max=20, perturb_prob=1))
+df10_1perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k10_1perturb<-suppressWarnings(apply(df10_1perturb, MARGIN=2, FUN=calc_NMI))
+
+#####k=20
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 20, nstart = 1, iter.max=20, perturb_prob=0))
+df20_0perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k20_0perturb<-suppressWarnings(apply(df20_0perturb, MARGIN=2, FUN=calc_NMI))
+#0.1 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 20, nstart = 1, iter.max=20, perturb_prob=0.1))
+df20_0.1perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k20_0.1perturb<-suppressWarnings(apply(df20_0.1perturb, MARGIN=2, FUN=calc_NMI))
+#0.25 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 20, nstart = 1, iter.max=20, perturb_prob=0.25))
+df20_0.25perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k20_0.25perturb<-suppressWarnings(apply(df20_0.25perturb, MARGIN=2, FUN=calc_NMI))
+#0.5 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 20, nstart = 1, iter.max=20, perturb_prob=0.5))
+df20_0.5perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k20_0.5perturb<-suppressWarnings(apply(df20_0.5perturb, MARGIN=2, FUN=calc_NMI))
+#1 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 20, nstart = 1, iter.max=20, perturb_prob=1))
+df20_1perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k20_1perturb<-suppressWarnings(apply(df20_1perturb, MARGIN=2, FUN=calc_NMI))
+
+#####k=30
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 30, nstart = 1, iter.max=20, perturb_prob=0))
+df30_0perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k30_0perturb<-suppressWarnings(apply(df30_0perturb, MARGIN=2, FUN=calc_NMI))
+#0.1 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 30, nstart = 1, iter.max=20, perturb_prob=0.1))
+df30_0.1perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k30_0.1perturb<-suppressWarnings(apply(df30_0.1perturb, MARGIN=2, FUN=calc_NMI))
+#0.25 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 30, nstart = 1, iter.max=20, perturb_prob=0.25))
+df30_0.25perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k30_0.25perturb<-suppressWarnings(apply(df30_0.25perturb, MARGIN=2, FUN=calc_NMI))
+#0.5 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 30, nstart = 1, iter.max=20, perturb_prob=0.5))
+df30_0.5perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k30_0.5perturb<-suppressWarnings(apply(df30_0.5perturb, MARGIN=2, FUN=calc_NMI))
+#1 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 30, nstart = 1, iter.max=20, perturb_prob=1))
+df30_1perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k30_1perturb<-suppressWarnings(apply(df30_1perturb, MARGIN=2, FUN=calc_NMI))
+
+#####k=40
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 40, nstart = 1, iter.max=20, perturb_prob=0))
+df40_0perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k40_0perturb<-suppressWarnings(apply(df40_0perturb, MARGIN=2, FUN=calc_NMI))
+#0.1 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 40, nstart = 1, iter.max=20, perturb_prob=0.1))
+df40_0.1perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k40_0.1perturb<-suppressWarnings(apply(df40_0.1perturb, MARGIN=2, FUN=calc_NMI))
+#0.25 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 40, nstart = 1, iter.max=20, perturb_prob=0.25))
+df40_0.25perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k40_0.25perturb<-suppressWarnings(apply(df40_0.25perturb, MARGIN=2, FUN=calc_NMI))
+#0.5 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 40, nstart = 1, iter.max=20, perturb_prob=0.5))
+df40_0.5perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k40_0.5perturb<-suppressWarnings(apply(df40_0.5perturb, MARGIN=2, FUN=calc_NMI))
+#1 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 40, nstart = 1, iter.max=20, perturb_prob=1))
+df40_1perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k40_1perturb<-suppressWarnings(apply(df40_1perturb, MARGIN=2, FUN=calc_NMI))
+
+#####k=50
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 50, nstart = 1, iter.max=20, perturb_prob=0))
+df50_0perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k50_0perturb<-suppressWarnings(apply(df50_0perturb, MARGIN=2, FUN=calc_NMI))
+#0.1 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 50, nstart = 1, iter.max=20, perturb_prob=0.1))
+df50_0.1perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k50_0.1perturb<-suppressWarnings(apply(df50_0.1perturb, MARGIN=2, FUN=calc_NMI))
+#0.25 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 50, nstart = 1, iter.max=20, perturb_prob=0.25))
+df50_0.25perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k50_0.25perturb<-suppressWarnings(apply(df50_0.25perturb, MARGIN=2, FUN=calc_NMI))
+#0.5 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 50, nstart = 1, iter.max=20, perturb_prob=0.5))
+df50_0.5perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k50_0.5perturb<-suppressWarnings(apply(df50_0.5perturb, MARGIN=2, FUN=calc_NMI))
+#1 perturb
+cluster_membership<-lapply(X=1:50, FUN= function(X) kmeans_perturb(cluster_space, 50, nstart = 1, iter.max=20, perturb_prob=1))
+df50_1perturb <- data.frame(matrix(unlist(cluster_membership), nrow=dim(cluster_space)[1], byrow=FALSE),stringsAsFactors=FALSE)
+rm(cluster_membership)
+NMI_k50_1perturb<-suppressWarnings(apply(df50_1perturb, MARGIN=2, FUN=calc_NMI))
+
+
+######NMI values
+
+to_plot<-rbind(melt(NMI_k10_0perturb) %>% mutate(k="k=10") %>% mutate("Perturb"=0),
+melt(NMI_k10_0.1perturb) %>% mutate(k="k=10") %>% mutate("Perturb"=0.1),
+melt(NMI_k10_0.25perturb) %>% mutate(k="k=10") %>% mutate("Perturb"=0.25),
+melt(NMI_k10_0.5perturb) %>% mutate(k="k=10") %>% mutate("Perturb"=0.5),
+melt(NMI_k10_1perturb) %>% mutate(k="k=10") %>% mutate("Perturb"=1),
+melt(NMI_k20_0perturb) %>% mutate(k="k=20") %>% mutate("Perturb"=0),
+melt(NMI_k20_0.1perturb) %>% mutate(k="k=20") %>% mutate("Perturb"=0.1),
+melt(NMI_k20_0.25perturb) %>% mutate(k="k=20") %>% mutate("Perturb"=0.25), #
+melt(NMI_k20_0.5perturb) %>% mutate(k="k=20") %>% mutate("Perturb"=0.5),
+melt(NMI_k20_1perturb) %>% mutate(k="k=20") %>% mutate("Perturb"=1),
+melt(NMI_k30_0perturb) %>% mutate(k="k=30") %>% mutate("Perturb"=0),
+melt(NMI_k30_0.1perturb) %>% mutate(k="k=30") %>% mutate("Perturb"=0.1), #
+melt(NMI_k30_0.25perturb) %>% mutate(k="k=30") %>% mutate("Perturb"=0.25),
+melt(NMI_k30_0.5perturb) %>% mutate(k="k=30") %>% mutate("Perturb"=0.5), #
+melt(NMI_k30_1perturb) %>% mutate(k="k=30") %>% mutate("Perturb"=1),
+melt(NMI_k40_0perturb) %>% mutate(k="k=40") %>% mutate("Perturb"=0),
+melt(NMI_k40_0.1perturb) %>% mutate(k="k=40") %>% mutate("Perturb"=0.1), #
+melt(NMI_k40_0.25perturb) %>% mutate(k="k=40") %>% mutate("Perturb"=0.25),
+melt(NMI_k40_0.5perturb) %>% mutate(k="k=40") %>% mutate("Perturb"=0.5),
+melt(NMI_k40_1perturb) %>% mutate(k="k=40") %>% mutate("Perturb"=1),
+melt(NMI_k50_0perturb) %>% mutate(k="k=50") %>% mutate("Perturb"=0),
+melt(NMI_k50_0.1perturb) %>% mutate(k="k=50") %>% mutate("Perturb"=0.1), #
+melt(NMI_k50_0.25perturb) %>% mutate(k="k=50") %>% mutate("Perturb"=0.25), #
+melt(NMI_k50_0.5perturb) %>% mutate(k="k=50") %>% mutate("Perturb"=0.5), #
+melt(NMI_k50_1perturb) %>% mutate(k="k=50") %>% mutate("Perturb"=1))
+
+########Rand
+rand_10_0perturb<-unname(unlist(apply(df10_0perturb, adjRRand, trcl=df10_0perturb[,1], MARGIN=2)))
+rand_10_0.1perturb<-unname(unlist(apply(df10_0.1perturb, adjRRand, trcl=df10_0.1perturb[,1], MARGIN=2)))
+rand_10_0.25perturb<-unname(unlist(apply(df10_0.25perturb, adjRRand, trcl=df10_0.25perturb[,1], MARGIN=2)))
+rand_10_0.5perturb<-unname(unlist(apply(df10_0.5perturb, adjRRand, trcl=df10_0.5perturb[,1], MARGIN=2)))
+rand_10_1perturb<-unname(unlist(apply(df10_1perturb, adjRRand, trcl=df10_1perturb[,1], MARGIN=2)))
+rand_20_0perturb<-unname(unlist(apply(df20_0perturb, adjRRand, trcl=df20_0perturb[,1], MARGIN=2)))
+rand_20_0.1perturb<-unname(unlist(apply(df20_0.1perturb, adjRRand, trcl=df20_0.1perturb[,1], MARGIN=2)))
+rand_20_0.25perturb<-unname(unlist(apply(df20_0.25perturb, adjRRand, trcl=df20_0.25perturb[,1], MARGIN=2)))
+rand_20_0.5perturb<-unname(unlist(apply(df20_0.5perturb, adjRRand, trcl=df20_0.5perturb[,1], MARGIN=2)))
+rand_20_1perturb<-unname(unlist(apply(df20_1perturb, adjRRand, trcl=df20_1perturb[,1], MARGIN=2)))
+rand_30_0perturb<-unname(unlist(apply(df30_0perturb, adjRRand, trcl=df30_0perturb[,1], MARGIN=2)))
+rand_30_0.1perturb<-unname(unlist(apply(df30_0.1perturb, adjRRand, trcl=df30_0.1perturb[,1], MARGIN=2)))
+rand_30_0.25perturb<-unname(unlist(apply(df30_0.25perturb, adjRRand, trcl=df30_0.25perturb[,1], MARGIN=2)))
+rand_30_0.5perturb<-unname(unlist(apply(df30_0.5perturb, adjRRand, trcl=df30_0.5perturb[,1], MARGIN=2)))
+rand_30_1perturb<-unname(unlist(apply(df30_1perturb, adjRRand, trcl=df30_1perturb[,1], MARGIN=2)))
+rand_40_0perturb<-unname(unlist(apply(df40_0perturb, adjRRand, trcl=df40_0perturb[,1], MARGIN=2)))
+rand_40_0.1perturb<-unname(unlist(apply(df40_0.1perturb, adjRRand, trcl=df40_0.1perturb[,1], MARGIN=2)))
+rand_40_0.25perturb<-unname(unlist(apply(df40_0.25perturb, adjRRand, trcl=df40_0.25perturb[,1], MARGIN=2)))
+rand_40_0.5perturb<-unname(unlist(apply(df40_0.5perturb, adjRRand, trcl=df40_0.5perturb[,1], MARGIN=2)))
+rand_40_1perturb<-unname(unlist(apply(df40_1perturb, adjRRand, trcl=df40_1perturb[,1], MARGIN=2)))
+rand_50_0perturb<-unname(unlist(apply(df50_0perturb, adjRRand, trcl=df50_0perturb[,1], MARGIN=2)))
+rand_50_0.1perturb<-unname(unlist(apply(df50_0.1perturb, adjRRand, trcl=df50_0.1perturb[,1], MARGIN=2)))
+rand_50_0.25perturb<-unname(unlist(apply(df50_0.25perturb, adjRRand, trcl=df50_0.25perturb[,1], MARGIN=2)))
+rand_50_0.5perturb<-unname(unlist(apply(df50_0.5perturb, adjRRand, trcl=df50_0.5perturb[,1], MARGIN=2)))
+rand_50_1perturb<-unname(unlist(apply(df50_1perturb, adjRRand, trcl=df50_1perturb[,1], MARGIN=2)))
+
+#########Size distributions
+
+get_cluster_sizes<-function(assignments){
+  return(table(assignments) %>% c())
+}
+
+sizes_10_0perturb<-apply(df10_0perturb, get_cluster_sizes, MARGIN=2)
+a<-left_join(melt(NMI_k10_0perturb), melt(sizes_10_0perturb), by=c("X1", "X2"))
+a$perturb=0
+a$k<-"k=10"
+sizes_10_1perturb<-apply(df10_1perturb, get_cluster_sizes, MARGIN=2)
+b<-left_join(melt(NMI_k10_1perturb), melt(sizes_10_1perturb), by=c("X1", "X2"))
+b$perturb=1
+b$k<-"k=10"
+
+sizes_20_0perturb<-apply(df20_0perturb, get_cluster_sizes, MARGIN=2)
+c<-left_join(melt(NMI_k20_0perturb), melt(sizes_20_0perturb), by=c("X1", "X2"))
+c$perturb=0
+c$k<-"k=20"
+sizes_20_1perturb<-apply(df20_1perturb, get_cluster_sizes, MARGIN=2)
+d<-left_join(melt(NMI_k20_1perturb), melt(sizes_20_1perturb), by=c("X1", "X2"))
+d$perturb=1
+d$k<-"k=20"
+
+sizes_30_0perturb<-apply(df30_0perturb, get_cluster_sizes, MARGIN=2)
+e<-left_join(melt(NMI_k30_0perturb), melt(sizes_30_0perturb), by=c("X1", "X2"))
+e$perturb=0
+e$k<-"k=30"
+sizes_30_1perturb<-apply(df30_1perturb, get_cluster_sizes, MARGIN=2)
+f<-left_join(melt(NMI_k30_1perturb), melt(sizes_30_1perturb), by=c("X1", "X2"))
+f$perturb=1
+f$k<-"k=30"
+
+sizes_40_0perturb<-apply(df40_0perturb, get_cluster_sizes, MARGIN=2)
+g<-left_join(melt(NMI_k40_0perturb), melt(sizes_40_0perturb), by=c("X1", "X2"))
+g$perturb=0
+g$k<-"k=40"
+sizes_40_1perturb<-apply(df40_1perturb, get_cluster_sizes, MARGIN=2)
+h<-left_join(melt(NMI_k40_1perturb), melt(sizes_40_1perturb), by=c("X1", "X2"))
+h$perturb=1
+h$k<-"k=40"
+
+sizes_50_0perturb<-apply(df50_0perturb, get_cluster_sizes, MARGIN=2)
+i<-left_join(melt(NMI_k50_0perturb), melt(sizes_50_0perturb), by=c("X1", "X2"))
+i$perturb=0
+i$k<-"k=50"
+sizes_50_1perturb<-apply(df50_1perturb, get_cluster_sizes, MARGIN=2)
+j<-left_join(melt(NMI_k50_1perturb), melt(sizes_50_1perturb), by=c("X1", "X2"))
+j$perturb=1
+j$k<-"k=50"
+
+plot_by_cluster_size<-rbind(a,b,c,d,e,f,g,h,i,j)
+
+ggplot(plot_by_cluster_size)+geom_point(aes(x=value.y, y=value.x, color=factor(perturb)), alpha=0.4)+labs(color="Perturb Probability")+theme_bw()+xlab("Number of Genes in Cluster")+ylab("NMI")+facet_grid(~k)+theme(axis.text=element_text(size=12), axis.title=element_text(size=16), strip.text=element_text(size=16), legend.title=element_text(size=16), legend.text=element_text(size=12), legend.position="bottom")
+
+
+plot_by_cluster_size
+```
+
+```{r}
+
+```
+
+
